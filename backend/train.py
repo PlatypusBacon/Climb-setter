@@ -13,299 +13,269 @@ Requirements:
 - scikit-learn
 """
 
+import torchvision
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from torch.utils.data import DataLoader
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
 import numpy as np
 import cv2
 import os
 import json
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+import torch
 
 # Configuration
 IMG_SIZE = (416, 416)  # Input image size
-BATCH_SIZE = 16
-EPOCHS = 50
-LEARNING_RATE = 0.001
+BATCH_SIZE = 1
+EPOCHS = 100
+LEARNING_RATE = 0.00001
 
 # Hold types
 HOLD_TYPES = ['jug', 'crimp', 'sloper', 'pinch', 'pocket', 'unknown']
 
+import matplotlib.pyplot as plt
 
-class ClimbingHoldDataset:
-    """
-    Dataset handler for climbing hold detection.
+def visualize_sample(image, heatmap):
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.title("Image")
+    plt.imshow(image)
+
+    plt.subplot(1, 2, 2)
+    plt.title("Heatmap")
+    plt.imshow(heatmap.squeeze(), cmap='jet')
+    plt.colorbar()
+
+    plt.show()
+
+def overlay_heatmap(image, heatmap):
+    heatmap = heatmap.squeeze()
+    heatmap = (heatmap * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    overlay = cv2.addWeighted(
+        (image * 255).astype(np.uint8),
+        0.6,
+        heatmap,
+        0.4,
+        0
+    )
+
+    return overlay
+
+def draw_predictions(image, holds):
+    img = (image * 255).astype(np.uint8).copy()
+
+    for x, y, conf in holds:
+        cv2.circle(img, (int(x), int(y)), 10, (0, 255, 0), 2)
+        cv2.putText(img, f"{conf:.2f}", (int(x), int(y)-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+    return img
+
+
+class ClimbingHoldDataset(torch.utils.data.Dataset):
     
-    Expected directory structure:
-    dataset/
-        images/
-            image1.jpg
-            image2.jpg
-            ...
-        annotations/
-            image1.json
-            image2.json
-            ...
-    
-    Annotation format (JSON):
-    {
-        "holds": [
-            {
-                "x": 100,
-                "y": 150,
-                "width": 50,
-                "height": 50,
-                "type": "jug",
-                "confidence": 1.0
-            },
-            ...
-        ]
-    }
-    """
-    
-    def __init__(self, dataset_path, img_size=IMG_SIZE):
-        self.dataset_path = Path(dataset_path)
+    def __init__(self, img_size=IMG_SIZE, transforms=None, augment=True):
         self.img_size = img_size
-        self.images_path = self.dataset_path / 'images'
-        self.annotations_path = self.dataset_path / 'annotations'
-        
-    def load_data(self):
-        """Load all images and annotations."""
-        images = []
-        heatmaps = []
-        
-        annotation_files = list(self.annotations_path.glob('*.json'))
-        
-        for ann_file in annotation_files:
-            img_name = ann_file.stem + '.jpg'
-            img_path = self.images_path / img_name
-            
-            if not img_path.exists():
-                continue
-            
-            # Load image
-            img = cv2.imread(str(img_path))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            self.original_h, self.original_w = img.shape[:2]
-            img_resized = cv2.resize(img, self.img_size)
-            img_resized = img_resized.astype(np.float32) / 255.0
-            
-            # Load annotations
-            with open(ann_file, 'r') as f:
-                annotations = json.load(f)
-            
-            # Create heatmap
-            heatmap = self._create_heatmap(annotations, img.shape[:2])
-            
-            images.append(img)
-            heatmaps.append(heatmap)
-        
-        return np.array(images), np.array(heatmaps)
-    
-    def _create_heatmap(self, annotations, img_shape):
-        h, w = img_shape
-        heatmap = np.zeros((h, w, 1), dtype=np.float32)
+        self.images_path = 'data/img'
+        self.annotations_path = 'data/label'
+        self.transforms = transforms
+        self.img_size = img_size
+        self.augment = augment
+        self.annotation_files = list(Path(self.annotations_path).glob('*.json'))
+    def __len__(self):
+        return len(self.annotation_files)
+
+    def __getitem__(self, idx):
+        ann_file = self.annotation_files[idx]
+
+        img_name = ann_file.stem + '.jpg'
+        img_path = self.images_path + '/' + img_name
+
+        # Load image
+        img = cv2.imread(str(img_path))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        orig_h, orig_w = img.shape[:2]
+
+        # Resize if needed
+        if self.img_size:
+            img = cv2.resize(img, self.img_size)
+            new_h, new_w = self.img_size
+            scale_x = new_w / orig_w
+            scale_y = new_h / orig_h
+        else:
+            new_h, new_w = orig_h, orig_w
+            scale_x, scale_y = 1.0, 1.0
+
+        # Convert to tensor
+        img = torch.tensor(img, dtype=torch.float32) / 255.0
+        img = img.permute(2, 0, 1)  # HWC -> CHW
+
+        # Load annotation
+        with open(ann_file, 'r') as f:
+            annotations = json.load(f)
+
+        boxes = []
 
         for hold in annotations.get('holds', []):
-            cx = int(hold['x'] * w / self.original_w)
-            cy = int(hold['y'] * h / self.original_h)
+            # Original format
+            x = hold['x']
+            y = hold['y']
+            w = hold['width']
+            h = hold['height']
 
-            sigma = max(5, int(min(hold['width'], hold['height']) / 4))
+            # Scale to resized image
+            x *= scale_x
+            y *= scale_y
+            w *= scale_x
+            h *= scale_y
 
-            x_grid = np.arange(0, w)
-            y_grid = np.arange(0, h)
-            x_grid, y_grid = np.meshgrid(x_grid, y_grid)
+            # Convert (center, w, h) -> (xmin, ymin, xmax, ymax)
+            xmin = x - w / 2
+            ymin = y - h / 2
+            xmax = x + w / 2
+            ymax = y + h / 2
 
-            gaussian = np.exp(-((x_grid - cx)**2 + (y_grid - cy)**2) / (2 * sigma**2))
+            boxes.append([xmin, ymin, xmax, ymax])
 
-            heatmap[:, :, 0] = np.maximum(heatmap[:, :, 0], gaussian)
+        # Handle no-box case
+        if len(boxes) == 0:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        else:
+            boxes = torch.tensor(boxes, dtype=torch.float32)
+            labels = torch.ones((len(boxes),), dtype=torch.int64)  # single class
 
-        return heatmap
-    
+        target = {
+            "boxes": boxes,
+            "labels": labels
+        }
+        if self.augment:
+        # Random horizontal flip
+            if np.random.rand() > 0.5:
+                img = torch.flip(img, [2])  # flip width
+                boxes[:, [0, 2]] = img.shape[2] - boxes[:, [2, 0]]
+            
+            # Random brightness/contrast
+            img = img * (0.8 + np.random.rand() * 0.4)
+            img = torch.clamp(img, 0, 1)
+
+        return img, target
 
 
 
-def build_model(input_shape=(*IMG_SIZE, 3)):
-    """
-    Build a U-Net style model for hold detection.
-    This architecture is good for detecting multiple objects with precise localization.
-    """
+   
+def build_the_overfitter(input_shape=(416, 416, 3)):
     inputs = keras.Input(shape=input_shape)
-    
-    # Encoder (Downsampling)
-    # Block 1
-    x = layers.Conv2D(64, 3, padding='same', activation='relu')(inputs)
-    x = layers.Conv2D(64, 3, padding='same', activation='relu')(x)
-    skip1 = x
-    x = layers.MaxPooling2D(2)(x)
-    
-    # Block 2
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-    skip2 = x
-    x = layers.MaxPooling2D(2)(x)
-    
-    # Block 3
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-    skip3 = x
-    x = layers.MaxPooling2D(2)(x)
-    
-    # Block 4
-    x = layers.Conv2D(512, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(512, 3, padding='same', activation='relu')(x)
-    skip4 = x
-    x = layers.MaxPooling2D(2)(x)
-    
-    # Bottleneck
-    x = layers.Conv2D(1024, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(1024, 3, padding='same', activation='relu')(x)
-    
-    # Decoder (Upsampling)
-    # Block 5
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate()([x, skip4])
-    x = layers.Conv2D(512, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(512, 3, padding='same', activation='relu')(x)
-    
-    # Block 6
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate()([x, skip3])
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-    
-    # Block 7
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate()([x, skip2])
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-    
-    # Block 8
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Concatenate()([x, skip1])
-    x = layers.Conv2D(64, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(64, 3, padding='same', activation='relu')(x)
-    
-    # Output layer - heatmap prediction
-    outputs = layers.Conv2D(1, 1, activation='sigmoid', padding='same')(x)
-    
-    model = keras.Model(inputs=inputs, outputs=outputs, name='climbing_hold_detector')
-    
-    return model
-
-
-def build_mobilenet_model(input_shape=(*IMG_SIZE, 3)):
-    """
-    Alternative lighter model using MobileNetV2 backbone.
-    Better for mobile deployment - smaller and faster.
-    """
-    # Use MobileNetV2 as backbone
-    base_model = keras.applications.MobileNetV2(
-        input_shape=input_shape,
-        include_top=False,
-        weights='imagenet'
-    )
-    
-    # Freeze base model initially
-    base_model.trainable = False
-    
-    inputs = keras.Input(shape=input_shape)
-    
-    # Encoder
-    x = base_model(inputs, training=False)
-    
-    # Decoder
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-    
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-    
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(64, 3, padding='same', activation='relu')(x)
-    
-    x = layers.UpSampling2D(2)(x)
-    x = layers.Conv2D(32, 3, padding='same', activation='relu')(x)
-    
-    x = layers.UpSampling2D(2)(x)
+    # time for literally just three conv layers
+    x = layers.Conv2D(16, 3, padding='same', activation='relu')(inputs)
     x = layers.Conv2D(16, 3, padding='same', activation='relu')(x)
-    
-    # Output
-    outputs = layers.Conv2D(1, 1, activation='sigmoid', padding='same')(x)
-    
-    model = keras.Model(inputs=inputs, outputs=outputs, name='climbing_hold_detector_mobile')
-    
-    return model
+    x = layers.Conv2D(16, 3, padding='same', activation='relu')(x)
 
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(x)
 
-def train_model(dataset_path, output_dir='./models', use_mobile=True):
+    return keras.Model(inputs, outputs)
+
+def build_baby_unet(input_shape=(416, 416, 3)):
+    inputs = keras.Input(shape=input_shape)
+
+    # Encoder
+    x1 = layers.Conv2D(16, 3, padding='same', activation='relu')(inputs)
+    x1 = layers.Conv2D(16, 3, padding='same', activation='relu')(x1)
+    p1 = layers.MaxPooling2D()(x1)
+
+    x2 = layers.Conv2D(32, 3, padding='same', activation='relu')(p1)
+    x2 = layers.Conv2D(32, 3, padding='same', activation='relu')(x2)
+    p2 = layers.MaxPooling2D()(x2)
+
+    x3 = layers.Conv2D(64, 3, padding='same', activation='relu')(p2)
+    x3 = layers.Conv2D(64, 3, padding='same', activation='relu')(x3)
+
+    # Decoder
+    u2 = layers.UpSampling2D()(x3)
+    u2 = layers.Concatenate()([u2, x2])
+    u2 = layers.Conv2D(32, 3, padding='same', activation='relu')(u2)
+
+    u1 = layers.UpSampling2D()(u2)
+    u1 = layers.Concatenate()([u1, x1])
+    u1 = layers.Conv2D(16, 3, padding='same', activation='relu')(u1)
+
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(u1)
+
+    return keras.Model(inputs, outputs)
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+def train_model(output_dir='./models', use_mobile=True):
     """Main training function."""
-    
     print("Loading dataset...")
-    dataset = ClimbingHoldDataset(dataset_path)
-    X, y = dataset.load_data()
+    dataset = ClimbingHoldDataset(img_size=(512, 512))
     
-    print(f"Loaded {len(X)} images")
-    
-    # Split data
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-    
-    print(f"Training samples: {len(X_train)}")
-    print(f"Validation samples: {len(X_val)}")
-    
-    # Build model
-    if use_mobile:
-        print("Building MobileNetV2-based model...")
-        model = build_mobilenet_model()
-    else:
-        print("Building U-Net model...")
-        model = build_model()
-    
-    # Compile model
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy', keras.metrics.Precision(), keras.metrics.Recall()]
-    )
-    
-    model.summary()
-    
-    # Callbacks
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            os.path.join(output_dir, 'best_model.h5'),
-            save_best_only=True,
-            monitor='val_loss'
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=10,
-            restore_best_weights=True
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-7
-        )
-    ]
-    
-    # Train
-    print("Starting training...")
-    history = model.fit(
-        X_train, y_train,
+    dataloader = DataLoader(
+        dataset,
         batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        validation_data=(X_val, y_val),
-        callbacks=callbacks
+        shuffle=True,
+        collate_fn=collate_fn
     )
     
-    # Save final model
-    model.save(os.path.join(output_dir, 'final_model.h5'))
     
+    print("making rcnn")
+    model = fasterrcnn_resnet50_fpn(pretrained=True)
+    # Freeze backbone initially for small dataset
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    num_classes = 2
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+
+    model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
+        in_features,
+        num_classes
+    )
+
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+        )
+    for epoch in range(EPOCHS):
+        model.train()
+
+        total_loss = 0
+
+        for images, targets in dataloader:
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            loss = sum(loss for loss in loss_dict.values())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+        scheduler.step(total_loss)
+
+        print(f"Epoch {epoch}, Loss: {total_loss}")
+
+    # Save final model
+    # Replace model.save() with:
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, os.path.join(output_dir, 'final_model.pth'))
+
     return model, history
 
 
@@ -444,9 +414,7 @@ if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description='Train climbing hold detection model')
-    parser.add_argument('--dataset', type=str, required=True, help='Path to dataset directory')
     parser.add_argument('--output', type=str, default='./models', help='Output directory')
-    parser.add_argument('--mobile', action='store_true', help='Use MobileNet architecture')
     parser.add_argument('--convert', action='store_true', help='Convert to TFLite after training')
     
     args = parser.parse_args()
@@ -455,11 +423,10 @@ if __name__ == '__main__':
     os.makedirs(args.output, exist_ok=True)
     
     # Train model
-    model, history = train_model(args.dataset, args.output, use_mobile=args.mobile)
-    
+    model, history = train_model(args.output, use_mobile=args.mobile)
     # Convert to TFLite
     if args.convert:
-        model_path = os.path.join(args.output, 'best_model.h5')
+        model_path = os.path.join(args.output, 'best_model.pth')
         tflite_path = os.path.join(args.output, 'model.tflite')
         convert_to_tflite(model_path, tflite_path, quantize=True)
         
