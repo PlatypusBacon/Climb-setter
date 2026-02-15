@@ -213,7 +213,7 @@ def build_baby_unet(input_shape=(416, 416, 3)):
 def collate_fn(batch):
     return tuple(zip(*batch))
 
-def train_model(output_dir='./models', use_mobile=True):
+def train_model(output_dir='./models'):
     """Main training function."""
     print("Loading dataset...")
     dataset = ClimbingHoldDataset(img_size=(512, 512))
@@ -276,7 +276,7 @@ def train_model(output_dir='./models', use_mobile=True):
         'optimizer_state_dict': optimizer.state_dict(),
     }, os.path.join(output_dir, 'final_model.pth'))
 
-    return model, history
+    return model
 
 
 def convert_to_tflite(model_path, output_path='model.tflite', quantize=True):
@@ -423,7 +423,7 @@ if __name__ == '__main__':
     os.makedirs(args.output, exist_ok=True)
     
     # Train model
-    model, history = train_model(args.output, use_mobile=args.mobile)
+    model = train_model(args.output)
     # Convert to TFLite
     if args.convert:
         model_path = os.path.join(args.output, 'best_model.pth')
