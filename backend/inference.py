@@ -137,7 +137,7 @@ def _decode_anchor_output(pred_raw, img_h, img_w, num_anchors=6, num_classes=1,
     return boxes, scores
 
 
-def _decode_centernet_output(outputs, img_h, img_w, conf_threshold=0.5):
+def _decode_centernet_output(outputs, img_h, img_w, conf_threshold=0.15):
     """
     Decode CenterNet dict output {'heatmap', 'wh', 'offset'} into boxes + scores.
     All tensors are numpy arrays at this point.
@@ -187,6 +187,17 @@ def _infer_keras(model, image_bgr, conf_threshold=0.5, input_size=(320, 320)):
         scores : np.ndarray (N,)
     """
     import tensorflow as tf
+    print("OUTPUT TYPE:", type(outputs))
+
+    if isinstance(outputs, dict):
+        for k, v in outputs.items():
+            print(k, v.shape)
+    else:
+        if isinstance(outputs, (list, tuple)):
+            for i, v in enumerate(outputs):
+                print(f"output[{i}]:", v.shape)
+        else:
+            print("single output:", outputs.shape)
 
     img_h, img_w = image_bgr.shape[:2]
 
@@ -255,14 +266,42 @@ def _infer_tflite(interpreter, image_bgr, conf_threshold=0.5):
     raw = {d['name']: interpreter.get_tensor(d['index']) for d in output_details}
 
     # ── CenterNet outputs ────────────────────────────────────────────────
-    if 'heatmap' in raw:
-        boxes, scores = _decode_centernet_output(raw, img_h, img_w, conf_threshold)
+    # DEBUG: print outputs
+    for k, v in raw.items():
+        print("TFLite output:", k, v.shape)
 
-    # ── Anchor-based (SSD / EfficientDet) ───────────────────────────────
+    # Detect CenterNet by number + shape of outputs
+    if len(raw) == 3:
+        tensors = list(raw.values())
+
+        # Sort by last dimension so we map correctly:
+        # heatmap = channels (1)
+        # wh      = 2
+        # offset  = 2
+        tensors = sorted(tensors, key=lambda x: x.shape[-1])
+
+        # Expect shapes like:
+        # (1, oH, oW, 1), (1, oH, oW, 2), (1, oH, oW, 2)
+        heatmap = tensors[0]
+        wh      = tensors[1]
+        offset  = tensors[2]
+
+        outputs = {
+            'heatmap': heatmap,
+            'wh': wh,
+            'offset': offset
+        }
+        
+
+
+        boxes, scores = _decode_centernet_output(outputs, img_h, img_w, conf_threshold)
+        hm = outputs['heatmap']   # or correct index
+        print("Heatmap min/max:", hm.min(), hm.max())
     else:
+        # fallback to anchor decoder
         all_boxes, all_scores = [], []
         for tensor in raw.values():
-            if tensor.ndim == 4:                    # (1, gH, gW, anchors*(5+C))
+            if tensor.ndim == 4:
                 b, s = _decode_anchor_output(
                     tensor, img_h, img_w,
                     conf_threshold=conf_threshold
@@ -271,7 +310,7 @@ def _infer_tflite(interpreter, image_bgr, conf_threshold=0.5):
                 all_scores.append(s)
 
         if all_boxes:
-            boxes  = np.concatenate(all_boxes,  axis=0)
+            boxes  = np.concatenate(all_boxes, axis=0)
             scores = np.concatenate(all_scores, axis=0)
         else:
             boxes  = np.zeros((0, 4), dtype=np.float32)
@@ -331,7 +370,7 @@ class ClimbingHoldDetector:
       .tflite         → TensorFlow Lite
     """
 
-    def __init__(self, model_path, confidence_threshold=0.5,
+    def __init__(self, model_path, confidence_threshold=0.8,
                  device=None, max_display_size=(1100, 800),
                  input_size=(320, 320)):
         """

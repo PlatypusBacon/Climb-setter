@@ -79,7 +79,7 @@ class HoldDetectionService {
 
   HoldDetectionService({
     this.modelAssetPath      = 'assets/model.tflite',
-    this.confidenceThreshold = 0.5,
+    this.confidenceThreshold = 0.8,
     this.inputSize           = (width: 320, height: 320),
     this.numThreads          = 2,
     // ── Ignored parameters kept for API compatibility with the old HTTP service ──
@@ -101,6 +101,10 @@ class HoldDetectionService {
     );
 
     _interpreter = Interpreter.fromBuffer(modelBytes, options: options);
+
+    final inputTensor = _interpreter!.getInputTensor(0);
+    print('Input type: ${inputTensor.type}');
+    print('Input shape: ${inputTensor.shape}');
 
     // Wrap in IsolateInterpreter so inference never blocks the UI thread
     _isolateInterpreter = await IsolateInterpreter.create(

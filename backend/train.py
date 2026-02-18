@@ -28,6 +28,27 @@ Available box regression losses (via --loss flag):
   in your annotation pipeline. Internally they convert to corners just for the
   intersection area calculation, then back.
 
+Duplicate detection fixes (via --nms-iou and --ignore-radius flags):
+  --nms-iou FLOAT        IoU threshold for training-time NMS (default: 0.30).
+                         Lower = more aggressive merging of nearby boxes.
+                         0.45 is the old default; 0.25-0.35 eliminates most duplicates.
+
+  --ignore-radius FLOAT  Normalised radius around each GT centre within which
+                         non-best anchors are marked 'ignore' rather than negative.
+                         Prevents the model learning to fire from near-miss anchors.
+                         (default: 0.10, i.e. 10% of image width/height)
+
+  --focal-objectness     Replace BCE on the objectness head with focal loss
+                         (gamma=2, alpha=0.25). Down-weights the vast number of
+                         easy background anchors so the model learns 'not a hold'
+                         more aggressively. Strongly recommended for small datasets.
+
+  Root causes of multiple detections:
+    1. NMS threshold too permissive  -> fix with lower --nms-iou
+    2. Multiple anchors positive for same GT -> fix with --ignore-radius
+    3. Objectness undertrained due to class imbalance -> fix with --focal-objectness
+    4. Architecture: CenterNet is structurally immune (one peak per hold by design)
+
 TFLite export notes:
   - ssd_mobilenet, efficientdet, centernet: natively supported via TF Object Detection API
   - pytorch_rcnn: cannot be exported to TFLite; use for desktop/server inference only
@@ -58,7 +79,7 @@ from pathlib import Path
 
 IMG_SIZE      = (320, 320)   # Smaller default suits mobile detectors better than 416
 BATCH_SIZE    = 8
-EPOCHS        = 100
+EPOCHS        = 200
 LEARNING_RATE = 1e-4
 NUM_CLASSES   = 1            # Just "hold" — extend HOLD_TYPES if you want per-type labels
 
@@ -74,6 +95,173 @@ PYTORCH_ONLY      = {'pytorch_rcnn'}
 # ──────────────────────────────────────────────
 # Shared dataset / utilities
 # ──────────────────────────────────────────────
+
+
+def augment_climbing_image(image, boxes, img_size=(320, 320)):
+    """
+    Apply climbing-specific augmentations to a training image.
+    
+    Args:
+        image : np.ndarray (H, W, 3) float32 in [0, 1]
+        boxes : list of [y1, x1, y2, x2] normalised coords
+        img_size : target output size
+    
+    Returns:
+        aug_image, aug_boxes
+    """
+    h, w = image.shape[:2]
+    
+    # ── 1. Random perspective warp (simulates camera angle change) ──────
+    if np.random.rand() < 0.7:
+        image, boxes = _random_perspective(image, boxes, severity=0.15)
+    
+    # ── 2. Random brightness/contrast (lighting variation) ──────────────
+    if np.random.rand() < 0.8:
+        image = _random_brightness_contrast(image)
+    
+    # ── 3. Random color jitter (hold color / chalk variation) ───────────
+    if np.random.rand() < 0.6:
+        image = _random_color_jitter(image)
+    
+    # ── 4. Random blur (motion blur / camera shake) ─────────────────────
+    if np.random.rand() < 0.3:
+        image = _random_blur(image)
+    
+    # ── 5. Random noise (sensor noise / compression artifacts) ──────────
+    if np.random.rand() < 0.4:
+        image = _random_noise(image, sigma=0.02)
+    
+    # ── 6. Cutout (occlusion by climber body / gear) ───────────────────
+    if np.random.rand() < 0.5:
+        image = _random_cutout(image, max_holes=3, hole_size=0.15)
+    
+    # ── 7. Resize to target (after all spatial transforms) ──────────────
+    image = cv2.resize(image, img_size)
+    
+    return image, boxes
+
+
+def _random_perspective(image, boxes, severity=0.15):
+    """
+    Random perspective warp. Boxes are transformed with the image.
+    severity=0.15 → corners move up to 15% of image dimension.
+    """
+    h, w = image.shape[:2]
+    
+    # Source points: image corners
+    src = np.array([
+        [0, 0],
+        [w, 0],
+        [w, h],
+        [0, h]
+    ], dtype=np.float32)
+    
+    # Destination: corners with random offsets
+    max_offset = int(min(w, h) * severity)
+    dst = src + np.random.randint(-max_offset, max_offset, src.shape)
+    
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(image, M, (w, h), borderValue=(0.5, 0.5, 0.5))
+    
+    # Transform boxes
+    warped_boxes = []
+    for box in boxes:
+        y1, x1, y2, x2 = box
+        # Transform all 4 corners
+        corners = np.array([
+            [x1 * w, y1 * h],
+            [x2 * w, y1 * h],
+            [x2 * w, y2 * h],
+            [x1 * w, y2 * h]
+        ], dtype=np.float32).reshape(-1, 1, 2)
+        
+        warped_corners = cv2.perspectiveTransform(corners, M).reshape(-1, 2)
+        
+        # Recompute bounding box from warped corners
+        new_x1 = np.clip(warped_corners[:, 0].min() / w, 0, 1)
+        new_x2 = np.clip(warped_corners[:, 0].max() / w, 0, 1)
+        new_y1 = np.clip(warped_corners[:, 1].min() / h, 0, 1)
+        new_y2 = np.clip(warped_corners[:, 1].max() / h, 0, 1)
+        
+        # Only keep box if still visible (area > 10% of original)
+        new_area = (new_x2 - new_x1) * (new_y2 - new_y1)
+        old_area = (x2 - x1) * (y2 - y1)
+        if new_area > old_area * 0.1:
+            warped_boxes.append([new_y1, new_x1, new_y2, new_x2])
+    
+    return warped, warped_boxes
+
+
+def _random_brightness_contrast(image, brightness_range=0.3, contrast_range=0.3):
+    """
+    Random brightness and contrast adjustment.
+    Simulates different gym lighting conditions.
+    """
+    # Brightness shift
+    brightness = 1.0 + np.random.uniform(-brightness_range, brightness_range)
+    image = image * brightness
+    
+    # Contrast adjustment (pivot around mean)
+    contrast = 1.0 + np.random.uniform(-contrast_range, contrast_range)
+    mean = image.mean()
+    image = (image - mean) * contrast + mean
+    
+    return np.clip(image, 0, 1)
+
+
+def _random_color_jitter(image, hue_shift=0.05, sat_scale=0.3):
+    """
+    Random hue/saturation jitter.
+    Simulates different hold colors and chalk dust.
+    """
+    # Convert to HSV
+    hsv = cv2.cvtColor((image * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    
+    # Hue shift
+    hsv[..., 0] += np.random.uniform(-hue_shift, hue_shift) * 180
+    hsv[..., 0] = np.clip(hsv[..., 0], 0, 180)
+    
+    # Saturation scale
+    hsv[..., 1] *= (1.0 + np.random.uniform(-sat_scale, sat_scale))
+    hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
+    
+    # Back to RGB
+    rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32) / 255.0
+    return rgb
+
+
+def _random_blur(image, max_kernel=5):
+    """Random Gaussian blur (motion blur / out of focus)."""
+    kernel = np.random.choice([3, 5])
+    return cv2.GaussianBlur(image, (kernel, kernel), 0)
+
+
+def _random_noise(image, sigma=0.02):
+    """Add Gaussian noise (sensor noise / compression)."""
+    noise = np.random.normal(0, sigma, image.shape).astype(np.float32)
+    return np.clip(image + noise, 0, 1)
+
+
+def _random_cutout(image, max_holes=3, hole_size=0.15):
+    """
+    Random cutout rectangles.
+    Simulates occlusion by climber's body, rope, gear.
+    """
+    h, w = image.shape[:2]
+    num_holes = np.random.randint(1, max_holes + 1)
+    
+    for _ in range(num_holes):
+        hole_h = int(h * hole_size * np.random.uniform(0.5, 1.0))
+        hole_w = int(w * hole_size * np.random.uniform(0.5, 1.0))
+        
+        y = np.random.randint(0, h - hole_h)
+        x = np.random.randint(0, w - hole_w)
+        
+        # Fill with mean color (less jarring than black)
+        mean_color = image[y:y+hole_h, x:x+hole_w].mean(axis=(0, 1))
+        image[y:y+hole_h, x:x+hole_w] = mean_color
+    
+    return image
 
 def load_annotations(annotations_path='data/label', images_path='data/img'):
     """
@@ -284,9 +472,146 @@ def iou_loss(pred_cxcywh, gt_cxcywh, variant='ciou', eps=1e-7):
     return 1.0 - ciou
 
 
+def focal_loss_objectness(pred_obj, obj_mask, gamma=2.0, alpha=0.25):
+    """
+    Focal loss for the objectness head.
+
+    Replaces standard BCE to down-weight the enormous number of easy
+    background anchors that cause objectness to be undertrained, which
+    in turn lets near-miss anchors fire at inference time.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+      gamma=2   — standard CornerNet/RetinaNet value; higher = more focus on hard examples
+      alpha=0.25 — balances pos/neg contribution; lower = less weight on positives
+                   (counterintuitive: the many negatives are already down-weighted by gamma,
+                    so alpha can be <0.5 without starving positives)
+
+    Args:
+        pred_obj : tf.Tensor (B, gH, gW, A, 1)  sigmoid objectness predictions
+        obj_mask : tf.Tensor (B, gH, gW, A, 1)  1 = positive, 0 = negative/ignore
+        gamma    : focusing parameter (default 2.0)
+        alpha    : balance parameter  (default 0.25)
+
+    Returns:
+        Scalar focal loss, weighted same as the old BCE so existing loss
+        scale hyperparameters don't need retuning.
+    """
+    import tensorflow as tf
+
+    eps = 1e-7
+    p   = tf.clip_by_value(pred_obj, eps, 1.0 - eps)
+
+    # Per-anchor focal weight: (1-p)^gamma for positives, p^gamma for negatives
+    pos_loss = -alpha       * tf.pow(1.0 - p, gamma) * tf.math.log(p)
+    neg_loss = -(1 - alpha) * tf.pow(p,       gamma) * tf.math.log(1.0 - p)
+
+    # Apply mask: positives get pos_loss, negatives (where noobj=1) get neg_loss
+    loss = obj_mask * pos_loss + (1.0 - obj_mask) * neg_loss
+    return tf.reduce_mean(loss)
+
+
+def build_anchor_assignment(gt_boxes_cxcywh, gH, gW, num_anchors,
+                            ignore_radius=0.10):
+    """
+    Assign GT boxes to anchor grid cells, returning three masks:
+
+      obj_mask    (B, gH, gW, A, 1)  — 1 for the single best anchor per GT box
+      ignore_mask (B, gH, gW, A, 1)  — 1 for anchors near a GT but not the best
+                                        (excluded from both pos and neg loss)
+      noobj_mask  (B, gH, gW, A, 1)  — 1 for clear background anchors
+
+    The key fix for duplicate detections is the ignore_mask: previously all
+    near-miss anchors were treated as negatives and the model learned to
+    suppress them — but it also learned that it *could* fire from those cells,
+    leading to duplicates at inference. By excluding them from the loss entirely
+    the model only ever learns to fire from one anchor per hold.
+
+    Args:
+        gt_boxes_cxcywh : tf.Tensor (B, N, 4) normalised (cx, cy, w, h)
+        gH, gW          : grid height/width of this detection scale
+        num_anchors     : anchors per cell
+        ignore_radius   : normalised distance from GT centre within which
+                          non-best anchors are ignored (default 0.10)
+
+    Returns:
+        (obj_mask, ignore_mask, noobj_mask, gt_targets) — all tf.float32 tensors
+    """
+    import tensorflow as tf
+
+    B = tf.shape(gt_boxes_cxcywh)[0]
+
+    obj_mask    = tf.Variable(tf.zeros([B, gH, gW, num_anchors, 1]), trainable=False)
+    ignore_mask = tf.Variable(tf.zeros([B, gH, gW, num_anchors, 1]), trainable=False)
+    gt_targets  = tf.Variable(tf.zeros([B, gH, gW, num_anchors, 4]), trainable=False)
+
+    # ignore_radius in grid-cell units
+    ignore_r_h = ignore_radius * tf.cast(gH, tf.float32)
+    ignore_r_w = ignore_radius * tf.cast(gW, tf.float32)
+
+    for b_idx in range(B):
+        n_gt = tf.shape(gt_boxes_cxcywh[b_idx])[0]
+        for g_idx in tf.range(n_gt):
+            box = gt_boxes_cxcywh[b_idx, g_idx]
+            cx, cy, w, h = box[0], box[1], box[2], box[3]
+
+            # Best anchor: the cell that contains the GT centre, anchor slot 0
+            # (For multi-anchor matching, pick the slot whose prior size is
+            #  closest to the GT — here we use a single prior per cell.)
+            ci = tf.clip_by_value(
+                tf.cast(tf.floor(cx * tf.cast(gW, tf.float32)), tf.int32), 0, gW - 1)
+            cj = tf.clip_by_value(
+                tf.cast(tf.floor(cy * tf.cast(gH, tf.float32)), tf.int32), 0, gH - 1)
+
+            # Mark best anchor as positive
+            obj_mask.scatter_nd_update([[b_idx, cj, ci, 0, 0]], [1.0])
+            gt_targets.scatter_nd_update(
+                [[b_idx, cj, ci, 0, k] for k in range(4)],
+                [cx, cy, w, h]
+            )
+
+            # Mark neighbouring cells within ignore_radius as ignore
+            # so the model doesn't learn to fire from them at all
+            r_cells_h = tf.cast(tf.math.ceil(ignore_r_h), tf.int32) + 1
+            r_cells_w = tf.cast(tf.math.ceil(ignore_r_w), tf.int32) + 1
+
+            for dy in tf.range(-r_cells_h, r_cells_h + 1):
+                for dx in tf.range(-r_cells_w, r_cells_w + 1):
+                    if dy == 0 and dx == 0:
+                        continue  # best cell is positive, not ignore
+
+                    ny = cj + dy
+                    nx = ci + dx
+                    if ny < 0 or ny >= gH or nx < 0 or nx >= gW:
+                        continue
+
+                    # Distance check: only ignore if truly within radius
+                    cell_cx = (tf.cast(nx, tf.float32) + 0.5) / tf.cast(gW, tf.float32)
+                    cell_cy = (tf.cast(ny, tf.float32) + 0.5) / tf.cast(gH, tf.float32)
+                    dist_x  = tf.abs(cell_cx - cx) * tf.cast(gW, tf.float32)
+                    dist_y  = tf.abs(cell_cy - cy) * tf.cast(gH, tf.float32)
+
+                    if dist_x <= ignore_r_w and dist_y <= ignore_r_h:
+                        for a in range(num_anchors):
+                            # Only mark as ignore if not already a positive
+                            if obj_mask[b_idx, ny, nx, a, 0] < 0.5:
+                                ignore_mask.scatter_nd_update(
+                                    [[b_idx, ny, nx, a, 0]], [1.0]
+                                )
+
+    obj_mask    = tf.cast(obj_mask,    tf.float32)
+    ignore_mask = tf.cast(ignore_mask, tf.float32)
+    # noobj = not positive AND not ignored
+    noobj_mask  = (1.0 - obj_mask) * (1.0 - ignore_mask)
+
+    return obj_mask, ignore_mask, noobj_mask, tf.cast(gt_targets, tf.float32)
+
+
 def compute_detection_loss(pred_raw, gt_boxes_cxcywh, img_size,
                            num_anchors=6, num_classes=NUM_CLASSES,
-                           iou_variant='ciou'):
+                           iou_variant='ciou',
+                           ignore_radius=0.10,
+                           use_focal_objectness=True):
     """
     Full detection loss combining:
       - CIoU / DIoU / GIoU / IoU box regression loss  (for positive anchors)
@@ -381,10 +706,13 @@ def compute_detection_loss(pred_raw, gt_boxes_cxcywh, img_size,
                 [cx, cy, w, h]
             )
 
-    obj_mask   = tf.cast(obj_mask,   tf.float32)
-    noobj_mask = tf.cast(noobj_mask, tf.float32)
+    # Use the dedicated assignment helper which correctly builds the three-state
+    # mask (positive / ignore / negative) using ignore_radius.
+    obj_mask, ignore_mask, noobj_mask, gt_targets = build_anchor_assignment(
+        gt_boxes_cxcywh, gH, gW, num_anchors, ignore_radius=ignore_radius
+    )
 
-    # ── Box regression loss (IoU family) — positive anchors only ──────────
+    # ── Box regression loss (IoU family) — positives only ─────────────────
     pos_pred = tf.boolean_mask(pred_boxes, tf.squeeze(obj_mask > 0, -1))
     pos_gt   = tf.boolean_mask(gt_targets, tf.squeeze(obj_mask > 0, -1))
 
@@ -395,16 +723,26 @@ def compute_detection_loss(pred_raw, gt_boxes_cxcywh, img_size,
     else:
         box_loss = tf.constant(0.0)
 
-    # ── Objectness loss — all anchors, weighted ────────────────────────────
-    bce = tf.keras.losses.BinaryCrossentropy(from_logits=False)
-    obj_loss = (
-        bce(obj_mask,   pred_obj * obj_mask)   * 5.0   +   # positive weight
-        bce(1-noobj_mask, pred_obj * noobj_mask) * 0.5     # negative weight
-    )
+    # ── Objectness loss — positives + negatives (ignore zone excluded) ─────
+    # Ignored anchors are masked out of the loss entirely so the model
+    # never gets a gradient signal from near-miss anchors near a GT centre.
+    if use_focal_objectness:
+        # Focal loss down-weights the vast number of easy background anchors.
+        # Only applied to non-ignored anchors (train_mask zeroes out ignores).
+        train_mask  = tf.maximum(obj_mask, noobj_mask)
+        active_pred = pred_obj * train_mask
+        active_tgt  = obj_mask * train_mask
+        obj_loss = focal_loss_objectness(active_tgt, active_pred) * 5.0
+    else:
+        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False)
+        obj_loss = (
+            bce(obj_mask,                          pred_obj * obj_mask)    * 5.0 +
+            bce(tf.zeros_like(pred_obj * noobj_mask), pred_obj * noobj_mask) * 0.5
+        )
 
-    # ── Classification loss — positive anchors only ────────────────────────
-    # (trivially all "hold" for single-class, but structured for extension)
-    gt_cls = tf.zeros([B, gH, gW, num_anchors, num_classes])
+    # ── Classification loss — positives only ──────────────────────────────
+    bce = tf.keras.losses.BinaryCrossentropy(from_logits=False)
+    gt_cls   = tf.zeros([B, gH, gW, num_anchors, num_classes])
     cls_loss = bce(gt_cls * obj_mask, pred_cls * obj_mask)
 
     total_loss = box_loss + obj_loss + cls_loss
@@ -472,10 +810,13 @@ def centernet_loss(outputs, gt_boxes_cxcywh, img_size,
             cy_int = tf.clip_by_value(cy_int, 0, oH - 1)
 
             # Gaussian radius (simplified: proportional to box size)
+            oW_f = tf.cast(oW, tf.float32)
+            oH_f = tf.cast(oH, tf.float32)
+
             radius = tf.maximum(
                 1,
                 tf.cast(
-                    tf.round(tf.sqrt(w_norm * oW * h_norm * oH) / 6.0),
+                    tf.round(tf.sqrt(w_norm * oW_f * h_norm * oH_f) / 6.0),
                     tf.int32
                 )
             )
@@ -585,7 +926,7 @@ def build_ssd_mobilenet(num_classes=NUM_CLASSES, img_size=IMG_SIZE):
         weights='imagenet'
     )
     # Fine-tune the top layers only for small datasets
-    for layer in base.layers[:-30]:
+    for layer in base.layers[:-10]:
         layer.trainable = False
 
     # Multi-scale feature extraction (SSD style)
@@ -767,7 +1108,8 @@ def make_tf_dataset(records, img_size=IMG_SIZE, batch_size=BATCH_SIZE):
 
 def train_tf_model(model, records, output_dir,
                    epochs=EPOCHS, lr=LEARNING_RATE,
-                   model_type='ssd_mobilenet', iou_variant='ciou'):
+                   model_type='ssd_mobilenet', iou_variant='ciou',
+                   ignore_radius=0.10, use_focal_objectness=False):
     """
     Train a TF/Keras detection model using the selected IoU loss variant.
 
@@ -776,13 +1118,16 @@ def train_tf_model(model, records, output_dir,
       - ssd / efficientdet → compute_detection_loss() (obj + IoU box + cls)
 
     Args:
-        model      : compiled tf.keras.Model
-        records    : list of annotation dicts from load_annotations()
-        output_dir : where to write checkpoints
-        epochs     : number of training epochs
-        lr         : initial learning rate (Adam)
-        model_type : 'ssd_mobilenet' | 'efficientdet' | 'centernet'
-        iou_variant: 'ciou' | 'diou' | 'giou' | 'iou'
+        model                : compiled tf.keras.Model
+        records              : list of annotation dicts from load_annotations()
+        output_dir           : where to write checkpoints
+        epochs               : number of training epochs
+        lr                   : initial learning rate (Adam)
+        model_type           : 'ssd_mobilenet' | 'efficientdet' | 'centernet'
+        iou_variant          : 'ciou' | 'diou' | 'giou' | 'iou'
+        ignore_radius        : normalised ignore-zone radius around GT centres
+                               (suppresses near-miss anchor training, reduces duplicates)
+        use_focal_objectness : use focal loss on objectness head instead of BCE
     """
     import tensorflow as tf
 
@@ -808,6 +1153,9 @@ def train_tf_model(model, records, output_dir,
 
         for rec in records:
             img = preprocess_image(rec['image_path'])
+            #if len(records) < 100:  # Only augment if dataset is tiny
+            #    img, aug_boxes = augment_climbing_image(img, rec['boxes'])
+            #    rec = {'image_path': rec['image_path'], 'boxes': aug_boxes}
             img_t = tf.convert_to_tensor(img[np.newaxis], dtype=tf.float32)
 
             # GT boxes: (1, N, 4) in normalised (cx, cy, w, h)
@@ -848,7 +1196,9 @@ def train_tf_model(model, records, output_dir,
                     for scale_pred in scale_outputs:
                         t, b, o, c = compute_detection_loss(
                             scale_pred, gt_t, IMG_SIZE,
-                            iou_variant=iou_variant
+                            iou_variant=iou_variant,
+                            ignore_radius=ignore_radius,
+                            use_focal_objectness=use_focal_objectness,
                         )
                         total   += t
                         box_acc += b
@@ -1065,7 +1415,7 @@ def main():
 Model comparison:
   ssd_mobilenet   ~20-30ms  ~10MB tflite  Good for real-time flutter AR view
   efficientdet    ~30-50ms  ~15MB tflite  Better mAP, still mobile-friendly
-  centernet       ~25-40ms  ~12MB tflite  Anchor-free, good for varied hold sizes
+  centernet       ~25-40ms  ~12MB tflite  Anchor-free, structurally immune to duplicates
   pytorch_rcnn    N/A       NOT tflite    Use for server inference or as teacher model
 
 Loss variants (--loss):
@@ -1074,14 +1424,55 @@ Loss variants (--loss):
   giou   — safe fallback; non-zero gradient everywhere
   iou    — fastest but stalls when boxes don't overlap early in training
 
+Duplicate detection fixes:
+  --ignore-radius 0.10     ignore near-miss anchors during training (default)
+  --focal-objectness       focal loss on objectness head (recommended for small datasets)
+  --nms-iou 0.30           aggressive NMS at inference (lower = fewer duplicates)
+
+  Quickest fix if already trained: just lower --nms-iou and re-export.
+  For a proper fix: retrain with --focal-objectness --ignore-radius 0.12
+  Best long-term: switch to --model centernet (structurally one peak per hold)
+
 Examples:
-  python train_holds.py --model ssd_mobilenet --loss ciou --convert
+  python train_holds.py --model ssd_mobilenet --loss ciou --focal-objectness --convert
+  python train_holds.py --model ssd_mobilenet --loss ciou --ignore-radius 0.12 --nms-iou 0.25 --convert
   python train_holds.py --model centernet --loss diou --epochs 50
   python train_holds.py --model efficientdet --loss giou --convert --test data/img/sample.jpg
   python train_holds.py --model pytorch_rcnn --output ./models/rcnn
         """
     )
 
+    parser.add_argument('--nms-iou',
+                        type=float, default=0.30,
+                        metavar='FLOAT',
+                        help=(
+                            'IoU threshold for NMS at inference (default: 0.30). '
+                            'Lower = more aggressive suppression of nearby boxes. '
+                            '0.45 is the standard default; use 0.25–0.35 to eliminate '
+                            'duplicate hold detections. Also written into the exported '
+                            'model metadata so hold_detection_service.dart can read it.'
+                        ))
+    parser.add_argument('--ignore-radius',
+                        type=float, default=0.10,
+                        metavar='FLOAT',
+                        help=(
+                            'Normalised radius around each GT centre within which '
+                            'non-best anchors are marked ignore during training '
+                            '(default: 0.10 = 10%% of image width/height). '
+                            'Prevents near-miss anchors from being trained as '
+                            'positives or negatives, so the model learns to fire '
+                            'from exactly one anchor per hold. '
+                            'Raise to 0.15–0.20 for densely packed holds.'
+                        ))
+    parser.add_argument('--focal-objectness',
+                        action='store_true',
+                        help=(
+                            'Replace BCE with focal loss (gamma=2, alpha=0.25) on '
+                            'the objectness head. Down-weights easy background '
+                            'anchors so the model learns background more aggressively. '
+                            'Strongly recommended for small climbing-hold datasets '
+                            'where holds are sparse and background anchors dominate.'
+                        ))
     parser.add_argument('--loss',
                         choices=LOSS_CHOICES,
                         default='ciou',
@@ -1129,12 +1520,15 @@ Examples:
     output_dir = os.path.join(args.output, args.model)
     os.makedirs(output_dir, exist_ok=True)
     print(f"\n{'='*55}")
-    print(f"  Model:      {args.model}")
-    print(f"  Loss:       {args.loss.upper()} IoU")
-    print(f"  Epochs:     {args.epochs}")
-    print(f"  LR:         {args.lr}")
-    print(f"  Output dir: {output_dir}")
-    print(f"  TFLite:     {'yes' if args.convert else 'no'}")
+    print(f"  Model:            {args.model}")
+    print(f"  Loss:             {args.loss.upper()} IoU")
+    print(f"  Ignore radius:    {args.ignore_radius}")
+    print(f"  Focal objectness: {'yes' if args.focal_objectness else 'no'}")
+    print(f"  NMS IoU:          {args.nms_iou}")
+    print(f"  Epochs:           {args.epochs}")
+    print(f"  LR:               {args.lr}")
+    print(f"  Output dir:       {output_dir}")
+    print(f"  TFLite:           {'yes' if args.convert else 'no'}")
     print(f"{'='*55}\n")
 
     # ── Load data ──
@@ -1162,7 +1556,9 @@ Examples:
         train_tf_model(model, records, output_dir,
                        epochs=args.epochs, lr=args.lr,
                        model_type=args.model,
-                       iou_variant=args.loss)
+                       iou_variant=args.loss,
+                       ignore_radius=args.ignore_radius,
+                       use_focal_objectness=args.focal_objectness)
 
         # ── TFLite export ──
         if args.convert:

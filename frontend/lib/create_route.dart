@@ -534,36 +534,54 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
   Offset? _screenToImageCoordinates(Offset screenPosition, BoxConstraints constraints) {
     if (_imageSize == null) return null;
 
-    // Get transformation matrix
-    final matrix = _transformationController.value;
-    
-    // Apply inverse transformation to get image-space coordinates
-    final inverseMatrix = Matrix4.inverted(matrix);
-    final transformed = MatrixUtils.transformPoint(inverseMatrix, screenPosition);
-
-    // Calculate scale to fit image in container
-    final imageAspect = _imageSize!.width / _imageSize!.height;
+    // ── Step 1: Calculate where the image sits within the InteractiveViewer ──
+    final imageAspect     = _imageSize!.width / _imageSize!.height;
     final containerAspect = constraints.maxWidth / constraints.maxHeight;
     
-    double scale;
-    double offsetX = 0;
-    double offsetY = 0;
+    double displayScale;
+    double imageOffsetX = 0;
+    double imageOffsetY = 0;
+    double displayWidth;
+    double displayHeight;
     
     if (imageAspect > containerAspect) {
-      scale = constraints.maxWidth / _imageSize!.width;
-      final scaledHeight = _imageSize!.height * scale;
-      offsetY = (constraints.maxHeight - scaledHeight) / 2;
+      // Image is wider than container → letterbox top/bottom
+      displayScale  = constraints.maxWidth / _imageSize!.width;
+      displayWidth  = constraints.maxWidth;
+      displayHeight = _imageSize!.height * displayScale;
+      imageOffsetY  = (constraints.maxHeight - displayHeight) / 2;
     } else {
-      scale = constraints.maxHeight / _imageSize!.height;
-      final scaledWidth = _imageSize!.width * scale;
-      offsetX = (constraints.maxWidth - scaledWidth) / 2;
+      // Image is taller than container → letterbox left/right
+      displayScale  = constraints.maxHeight / _imageSize!.height;
+      displayWidth  = _imageSize!.width * displayScale;
+      displayHeight = constraints.maxHeight;
+      imageOffsetX  = (constraints.maxWidth - displayWidth) / 2;
     }
-    
-    // Convert to image coordinates
-    final imageX = (transformed.dx - offsetX) / scale;
-    final imageY = (transformed.dy - offsetY) / scale;
 
-    return Offset(imageX, imageY);
+    // ── Step 2: Convert screen tap to "image display space" ──
+    // Remove the letterbox offset so (0,0) is now the image top-left
+    final imageSpaceX = screenPosition.dx - imageOffsetX;
+    final imageSpaceY = screenPosition.dy - imageOffsetY;
+
+    // ── Step 3: Apply the inverse zoom/pan transformation ──
+    // The transformation controller's matrix operates on the image's
+    // coordinate space (after centering), so we invert it here.
+    final matrix        = _transformationController.value;
+    final inverseMatrix = Matrix4.inverted(matrix);
+    final transformed   = MatrixUtils.transformPoint(
+      inverseMatrix,
+      Offset(imageSpaceX, imageSpaceY),
+    );
+
+    // ── Step 4: Scale from display pixels to original image pixels ──
+    final imageX = transformed.dx / displayScale;
+    final imageY = transformed.dy / displayScale;
+
+    // ── Step 5: Clamp to image bounds (optional safety) ──
+    final clampedX = imageX.clamp(0.0, _imageSize!.width);
+    final clampedY = imageY.clamp(0.0, _imageSize!.height);
+
+    return Offset(clampedX, clampedY);
   }
 
   bool _isPointInHold(Offset point, ClimbingHold hold) {
