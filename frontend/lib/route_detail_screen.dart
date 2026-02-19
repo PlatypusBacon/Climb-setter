@@ -85,6 +85,12 @@ class RouteDetailScreen extends StatelessWidget {
                       case HoldRole.middle:
                         color = Colors.blue;
                         break;
+                      case HoldRole.hand:
+                        color = const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
+                        break;
+                      case HoldRole.foot:
+                        color = const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
+                        break;
                     }
                     
                     return Positioned(
@@ -201,6 +207,16 @@ class RouteDetailScreen extends StatelessWidget {
                         color = Colors.blue;
                         icon = Icons.circle;
                         roleText = 'Middle';
+                        break;
+                      case HoldRole.hand:
+                        color = const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
+                        icon = Icons.circle;
+                        roleText = 'Hand';
+                        break;
+                      case HoldRole.foot:
+                        color = const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
+                        icon = Icons.circle;
+                        roleText = 'Foot';
                         break;
                     }
                     

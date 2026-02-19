@@ -5,15 +5,15 @@
 /// (detectHoldsFromBytes, DetectionResult, DetectedHold, BoundingBox) is
 /// identical, so create_route_screen.dart needs only one line changed.
 ///
-/// Supported model architectures (auto-detected from output tensor names):
-///   CenterNet  — outputs named 'heatmap', 'wh', 'offset'
+/// Supported model architectures (auto-detected from output tensor shapes):
+///   CenterNet      — 3 outputs at 80×80: [1,80,80,1], [1,80,80,2], [1,80,80,2]
 ///   SSD / EfficientDet — one or more 4-D tensors (1, gH, gW, anchors*(5+C))
 ///
 /// Asset path: assets/model.tflite  (configure via [modelAssetPath])
 
-import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:developer';
 
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:image/image.dart' as img;
@@ -57,6 +57,26 @@ class DetectionResult {
 }
 
 // ─────────────────────────────────────────────
+// Internal struct for CenterNet tensor indices
+// ─────────────────────────────────────────────
+
+class _CenterNetIndices {
+  final int heatmapIdx;
+  final int whIdx;
+  final int offsetIdx;
+  final int outputH;
+  final int outputW;
+
+  const _CenterNetIndices({
+    required this.heatmapIdx,
+    required this.whIdx,
+    required this.offsetIdx,
+    required this.outputH,
+    required this.outputW,
+  });
+}
+
+// ─────────────────────────────────────────────
 // Service
 // ─────────────────────────────────────────────
 
@@ -64,7 +84,7 @@ class HoldDetectionService {
   /// Asset path to the bundled TFLite model.
   final String modelAssetPath;
 
-  /// Minimum confidence to keep a detection. Default matches the old server default.
+  /// Minimum confidence to keep a detection.
   final double confidenceThreshold;
 
   /// Input size the model was trained with (width, height).
@@ -76,13 +96,17 @@ class HoldDetectionService {
   IsolateInterpreter? _isolateInterpreter;
   Interpreter?        _interpreter;
   bool                _initialized = false;
+  bool                _inputIsUint8 = false;
+
+  /// Populated during init if the model is CenterNet; null for SSD/EfficientDet.
+  _CenterNetIndices?  _centerNetIndices;
 
   HoldDetectionService({
     this.modelAssetPath      = 'assets/model.tflite',
-    this.confidenceThreshold = 0.8,
+    this.confidenceThreshold = 0.7,
     this.inputSize           = (width: 320, height: 320),
     this.numThreads          = 2,
-    // ── Ignored parameters kept for API compatibility with the old HTTP service ──
+    // Ignored — kept for API compatibility with the old HTTP service
     String? baseUrl,
   });
 
@@ -92,25 +116,71 @@ class HoldDetectionService {
     if (_initialized) return;
 
     final options = InterpreterOptions()..threads = numThreads;
-
-    // Load model bytes from Flutter assets
-    final modelData = await rootBundle.load(modelAssetPath);
+    final modelData  = await rootBundle.load(modelAssetPath);
     final modelBytes = modelData.buffer.asUint8List(
-      modelData.offsetInBytes,
-      modelData.lengthInBytes,
+      modelData.offsetInBytes, modelData.lengthInBytes,
     );
 
     _interpreter = Interpreter.fromBuffer(modelBytes, options: options);
 
-    final inputTensor = _interpreter!.getInputTensor(0);
-    print('Input type: ${inputTensor.type}');
-    print('Input shape: ${inputTensor.shape}');
+    // Detect input type (float32 vs full-INT8-quantised uint8)
+    final inputType = _interpreter!.getInputTensor(0).type;
+    _inputIsUint8 = (inputType == TensorType.uint8);
+    log('[HoldDetection] Input type: $inputType  uint8=$_inputIsUint8');
+    log('[HoldDetection] Input shape: ${_interpreter!.getInputTensor(0).shape}');
 
-    // Wrap in IsolateInterpreter so inference never blocks the UI thread
+    // Inspect outputs to identify architecture
+    final outputCount = _interpreter!.getOutputTensors().length;
+    log('[HoldDetection] Output tensor count: $outputCount');
+
+    int? heatmapIdx, whIdx, offsetIdx, oH, oW;
+
+    for (var i = 0; i < outputCount; i++) {
+      final t = _interpreter!.getOutputTensor(i);
+      log('[HoldDetection] Output $i: "${t.name}" shape=${t.shape}');
+
+      // CenterNet outputs are all [1, oH, oW, C] where oH==oW (e.g. 80×80)
+      if (t.shape.length == 4 && t.shape[1] == t.shape[2]) {
+        final h = t.shape[1];
+        final w = t.shape[2];
+        final c = t.shape[3];
+
+        // In _ensureInitialized, replace the c==2 block:
+        if (c == 1 && heatmapIdx == null) {
+          heatmapIdx = i; oH = h; oW = w;
+        } else if (c == 2) {
+          final name = t.name.toLowerCase();
+          if (name.contains('wh') && whIdx == null) {
+            whIdx = i;
+          } else if ((name.contains('offset') || name.contains('off')) && offsetIdx == null) {
+            offsetIdx = i;
+          } else if (whIdx == null) {
+            whIdx = i;      // fallback: first c==2 tensor
+          } else if (offsetIdx == null) {
+            offsetIdx = i;  // fallback: second c==2 tensor
+          }
+        }
+      }
+    }
+
+    if (heatmapIdx != null && whIdx != null && offsetIdx != null &&
+        oH != null && oW != null) {
+      _centerNetIndices = _CenterNetIndices(
+        heatmapIdx: heatmapIdx,
+        whIdx:      whIdx,
+        offsetIdx:  offsetIdx,
+        outputH:    oH,
+        outputW:    oW,
+      );
+      log('[HoldDetection] Architecture: CenterNet '
+          '(heatmap=$heatmapIdx wh=$whIdx offset=$offsetIdx ${oH}x$oW)');
+    } else {
+      log('[HoldDetection] Architecture: SSD / EfficientDet');
+    }
+
     _isolateInterpreter = await IsolateInterpreter.create(
       address: _interpreter!.address,
     );
-
     _initialized = true;
   }
 
@@ -120,26 +190,21 @@ class HoldDetectionService {
       await _ensureInitialized();
       return true;
     } catch (e) {
+      log('[HoldDetection] healthCheck failed: $e');
       return false;
     }
   }
 
   // ── Public detection API ────────────────────────────────────────────────
 
-  /// Detect climbing holds in [imageBytes] (any format flutter/image can decode).
-  ///
-  /// Returns a [DetectionResult] with bounding boxes in *original* image-pixel
-  /// coordinates — identical to what the HTTP service used to return.
   Future<DetectionResult> detectHoldsFromBytes(Uint8List imageBytes) async {
     await _ensureInitialized();
 
-    // Decode to RGBA, record original dimensions
     final decoded = img.decodeImage(imageBytes);
     if (decoded == null) throw Exception('Could not decode image bytes.');
     final origW = decoded.width;
     final origH = decoded.height;
 
-    // Resize to model input size
     final resized = img.copyResize(
       decoded,
       width:  inputSize.width,
@@ -147,26 +212,14 @@ class HoldDetectionService {
       interpolation: img.Interpolation.linear,
     );
 
-    // Build float32 input tensor: shape [1, H, W, 3], values in [0, 1]
-    final inputTensor = _imageToFloat32List(resized);
+    final inputTensor = _buildInputTensor(resized);
 
-    // Collect output tensor info
-    final interpreter  = _interpreter!;
-    final outputCount  = interpreter.getOutputTensors().length;
-    final outputNames  = {
-      for (var i = 0; i < outputCount; i++)
-        interpreter.getOutputTensor(i).name: i
-    };
-
-    // ── Run inference in isolate ────────────────────────────────────────
-    List<DetectedHold> holds;
-
-    if (outputNames.containsKey('heatmap')) {
-      // CenterNet path
-      holds = await _runCenterNet(inputTensor, outputNames, origW, origH);
+    final List<DetectedHold> holds;
+    
+    if (_centerNetIndices != null) {
+      holds = await _runCenterNet(inputTensor, origW, origH);
     } else {
-      // SSD / EfficientDet path
-      holds = await _runAnchorBased(inputTensor, outputCount, origW, origH);
+      holds = await _runAnchorBased(inputTensor, origW, origH);
     }
 
     return DetectionResult(holds: holds, imageWidth: origW, imageHeight: origH);
@@ -175,35 +228,32 @@ class HoldDetectionService {
   // ── CenterNet inference ─────────────────────────────────────────────────
 
   Future<List<DetectedHold>> _runCenterNet(
-    List<List<List<List<double>>>> inputTensor,
-    Map<String, int> outputNames,
+    Object inputTensor,
     int origW,
     int origH,
   ) async {
-    final interpreter = _interpreter!;
+    final cn  = _centerNetIndices!;
+    final oH  = cn.outputH;
+    final oW  = cn.outputW;
 
-    // Allocate output buffers
-    final hmTensor  = interpreter.getOutputTensor(outputNames['heatmap']!);
-    final whtTensor = interpreter.getOutputTensor(outputNames['wh']!);
-    final offTensor = interpreter.getOutputTensor(outputNames['offset']!);
+    // Allocate nested-list output buffers — tflite_flutter fills these in-place.
+    // Each must exactly match the tensor shape: [1, oH, oW, C].
+    final hmOut = List.generate(1, (_) =>
+        List.generate(oH, (_) =>
+        List.generate(oW, (_) => List<double>.filled(1, 0.0))));
 
-    final oH = hmTensor.shape[1];
-    final oW = hmTensor.shape[2];
+    final whOut = List.generate(1, (_) =>
+        List.generate(oH, (_) =>
+        List.generate(oW, (_) => List<double>.filled(2, 0.0))));
 
-    final hmOut  = List.generate(1, (_) =>
-                   List.generate(oH, (_) =>
-                   List.generate(oW, (_) => List<double>.filled(1, 0))));
-    final whOut  = List.generate(1, (_) =>
-                   List.generate(oH, (_) =>
-                   List.generate(oW, (_) => List<double>.filled(2, 0))));
     final offOut = List.generate(1, (_) =>
-                   List.generate(oH, (_) =>
-                   List.generate(oW, (_) => List<double>.filled(2, 0))));
+        List.generate(oH, (_) =>
+        List.generate(oW, (_) => List<double>.filled(2, 0.0))));
 
     final outputs = <int, Object>{
-      outputNames['heatmap']!: hmOut,
-      outputNames['wh']!:      whOut,
-      outputNames['offset']!:  offOut,
+      cn.heatmapIdx: hmOut,
+      cn.whIdx:      whOut,
+      cn.offsetIdx:  offOut,
     };
 
     await _isolateInterpreter!.runForMultipleInputs([inputTensor], outputs);
@@ -213,6 +263,52 @@ class HoldDetectionService {
       oH: oH, oW: oW,
       origW: origW, origH: origH,
     );
+  }
+
+  Future<void> debugCenterNetOutputs(Uint8List imageBytes) async {
+    await _ensureInitialized();
+    final cn = _centerNetIndices!;
+
+    final decoded = img.decodeImage(imageBytes)!;
+    final resized = img.copyResize(decoded,
+        width: inputSize.width, height: inputSize.height);
+    final inputTensor = _buildInputTensor(resized);
+
+    final hmOut = List.generate(1, (_) => List.generate(cn.outputH, (_) =>
+        List.generate(cn.outputW, (_) => List<double>.filled(1, 0.0))));
+    final whOut = List.generate(1, (_) => List.generate(cn.outputH, (_) =>
+        List.generate(cn.outputW, (_) => List<double>.filled(2, 0.0))));
+    final offOut = List.generate(1, (_) => List.generate(cn.outputH, (_) =>
+        List.generate(cn.outputW, (_) => List<double>.filled(2, 0.0))));
+
+    await _isolateInterpreter!.runForMultipleInputs([inputTensor], {
+      cn.heatmapIdx: hmOut,
+      cn.whIdx:      whOut,
+      cn.offsetIdx:  offOut,
+    });
+
+    // Flatten heatmap to find global max/min/mean
+    double maxConf = 0, sum = 0;
+    int count = 0;
+    int peaksAbove01 = 0, peaksAbove05 = 0;
+    for (var y = 0; y < cn.outputH; y++) {
+      for (var x = 0; x < cn.outputW; x++) {
+        final v = (hmOut[0][y][x][0] as num).toDouble();
+        if (v > maxConf) maxConf = v;
+        sum += v;
+        count++;
+        if (v > 0.1) peaksAbove01++;
+        if (v > 0.5) peaksAbove05++;
+      }
+    }
+    final mean = sum / count;
+
+    log('[CenterNet DEBUG] Heatmap: max=$maxConf  mean=${mean.toStringAsFixed(4)}'
+        '  peaks>0.1=$peaksAbove01  peaks>0.5=$peaksAbove05');
+    log('[CenterNet DEBUG] confidenceThreshold=$confidenceThreshold');
+    log('[CenterNet DEBUG] Your threshold would find: '
+        '${peaksAbove05} detections at 0.5, '
+        '${peaksAbove01} at 0.1');
   }
 
   List<DetectedHold> _decodeCenterNet(
@@ -227,7 +323,7 @@ class HoldDetectionService {
         final conf = (hmOut[0][y][x][0] as num).toDouble();
         if (conf < confidenceThreshold) continue;
 
-        // Simple 3×3 local maximum check
+        // 3×3 local-maximum suppression — keeps only peak heatmap responses.
         bool isLocalMax = true;
         for (var dy = -1; dy <= 1 && isLocalMax; dy++) {
           for (var dx = -1; dx <= 1 && isLocalMax; dx++) {
@@ -239,12 +335,11 @@ class HoldDetectionService {
         }
         if (!isLocalMax) continue;
 
-        final offX = (offOut[0][y][x][0] as num).toDouble();
-        final offY = (offOut[0][y][x][1] as num).toDouble();
+        final offX  = (offOut[0][y][x][0] as num).toDouble();
+        final offY  = (offOut[0][y][x][1] as num).toDouble();
         final wNorm = (whOut[0][y][x][0] as num).toDouble();
         final hNorm = (whOut[0][y][x][1] as num).toDouble();
 
-        // Map to original image coordinates
         final cxImg = ((x + offX) / oW) * origW;
         final cyImg = ((y + offY) / oH) * origH;
         final wImg  = wNorm * origW;
@@ -266,19 +361,19 @@ class HoldDetectionService {
   // ── SSD / EfficientDet inference ────────────────────────────────────────
 
   Future<List<DetectedHold>> _runAnchorBased(
-    List<List<List<List<double>>>> inputTensor,
-    int outputCount,
+    Object inputTensor,
     int origW,
     int origH,
   ) async {
     final interpreter = _interpreter!;
+    final outputCount = interpreter.getOutputTensors().length;
 
-    // Build output buffers for all scale heads
     final outputs = <int, Object>{};
     final shapes  = <int, List<int>>{};
+
     for (var i = 0; i < outputCount; i++) {
       final t = interpreter.getOutputTensor(i);
-      shapes[i] = t.shape;   // [1, gH, gW, anchors*(5+C)]
+      shapes[i]  = t.shape;
       outputs[i] = _allocateBuffer(t.shape);
     }
 
@@ -300,21 +395,24 @@ class HoldDetectionService {
     required int origW, required int origH,
     int numAnchors = 6,
   }) {
-    // shape: [1, gH, gW, numAnchors*(5+C)]
-    final gH = shape[1];
-    final gW = shape[2];
+    // shape: [1, gH, gW, numAnchors*(5+numClasses)]
+    final gH         = shape[1];
+    final gW         = shape[2];
+    final innerSize  = shape[3]; // should be numAnchors * (5 + numClasses)
+    final numClasses = (innerSize ~/ numAnchors) - 5;
 
-    // Flatten to a 4D Dart list for indexing
-    // rawOutput is List<List<List<List<double>>>> from allocateBuffer
+    if (numClasses < 1) {
+      log('[HoldDetection] Skipping tensor with unexpected inner size $innerSize');
+      return [];
+    }
+
     final out = rawOutput as List;
-
     final List<DetectedHold> results = [];
 
     for (var gy = 0; gy < gH; gy++) {
       for (var gx = 0; gx < gW; gx++) {
         for (var a = 0; a < numAnchors; a++) {
-          final base = a * (5 + 1); // 5 + num_classes (1 for single-class)
-
+          final base   = a * (5 + numClasses);
           final rawCx  = _idx(out, 0, gy, gx, base + 0);
           final rawCy  = _idx(out, 0, gy, gx, base + 1);
           final rawW   = _idx(out, 0, gy, gx, base + 2);
@@ -324,16 +422,15 @@ class HoldDetectionService {
           final objConf = _sigmoid(rawObj);
           if (objConf < confidenceThreshold) continue;
 
-          // Decode grid-relative cx/cy → normalised image coords
           final cxNorm = (_sigmoid(rawCx) + gx) / gW;
           final cyNorm = (_sigmoid(rawCy) + gy) / gH;
           final wNorm  = math.exp(rawW) / gW;
           final hNorm  = math.exp(rawH) / gH;
 
-          final cxImg  = cxNorm * origW;
-          final cyImg  = cyNorm * origH;
-          final wImg   = wNorm  * origW;
-          final hImg   = hNorm  * origH;
+          final cxImg = cxNorm * origW;
+          final cyImg = cyNorm * origH;
+          final wImg  = wNorm  * origW;
+          final hImg  = hNorm  * origH;
 
           results.add(DetectedHold(
             bbox: BoundingBox(
@@ -351,17 +448,14 @@ class HoldDetectionService {
   // ── NMS ─────────────────────────────────────────────────────────────────
 
   List<DetectedHold> _nms(List<DetectedHold> detections,
-      // 0.30 matches the --nms-iou default in train_holds.py.
-      // Lower to 0.20 if duplicates still appear; raise toward 0.45 only if
-      // legitimate nearby holds are being incorrectly merged.
       {double iouThreshold = 0.30}) {
     if (detections.isEmpty) return [];
 
     final sorted = List<DetectedHold>.from(detections)
       ..sort((a, b) => b.confidence.compareTo(a.confidence));
 
-    final List<DetectedHold> kept = [];
-    final List<bool> suppressed = List.filled(sorted.length, false);
+    final kept       = <DetectedHold>[];
+    final suppressed = List.filled(sorted.length, false);
 
     for (var i = 0; i < sorted.length; i++) {
       if (suppressed[i]) continue;
@@ -377,12 +471,12 @@ class HoldDetectionService {
   }
 
   static double _iou(BoundingBox a, BoundingBox b) {
-    final ix1 = math.max(a.x1, b.x1);
-    final iy1 = math.max(a.y1, b.y1);
-    final ix2 = math.min(a.x2, b.x2);
-    final iy2 = math.min(a.y2, b.y2);
-    final iw  = math.max(0.0, ix2 - ix1);
-    final ih  = math.max(0.0, iy2 - iy1);
+    final ix1   = math.max(a.x1, b.x1);
+    final iy1   = math.max(a.y1, b.y1);
+    final ix2   = math.min(a.x2, b.x2);
+    final iy2   = math.min(a.y2, b.y2);
+    final iw    = math.max(0.0, ix2 - ix1);
+    final ih    = math.max(0.0, iy2 - iy1);
     final inter = iw * ih;
     final union = (a.x2 - a.x1) * (a.y2 - a.y1) +
                   (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
@@ -391,31 +485,34 @@ class HoldDetectionService {
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
-  /// Convert a decoded [img.Image] (RGBA) to a [1, H, W, 3] float32 list.
-  List<List<List<List<double>>>> _imageToFloat32List(img.Image image) {
+  Object _buildInputTensor(img.Image image) {
     final h = image.height;
     final w = image.width;
-    return List.generate(1, (_) =>
-      List.generate(h, (y) =>
-        List.generate(w, (x) {
-          final pixel = image.getPixel(x, y);
-          return [
-            pixel.r / 255.0,
-            pixel.g / 255.0,
-            pixel.b / 255.0,
-          ];
-        })
-      )
-    );
+
+    if (_inputIsUint8) {
+      return List.generate(1, (_) =>
+        List.generate(h, (y) =>
+          List.generate(w, (x) {
+            final pixel = image.getPixel(x, y);
+            return [pixel.r.toInt(), pixel.g.toInt(), pixel.b.toInt()];
+          })));
+    } else {
+      return List.generate(1, (_) =>
+        List.generate(h, (y) =>
+          List.generate(w, (x) {
+            final pixel = image.getPixel(x, y);
+            return [pixel.r / 255.0, pixel.g / 255.0, pixel.b / 255.0];
+          })));
+    }
   }
 
-  /// Allocate a nested Dart list matching [shape] for use as a TFLite output buffer.
+  /// Recursively allocate a nested Dart list matching [shape].
   Object _allocateBuffer(List<int> shape) {
     if (shape.length == 1) return List<double>.filled(shape[0], 0.0);
     return List.generate(shape[0], (_) => _allocateBuffer(shape.sublist(1)));
   }
 
-  /// Index into a nested 4-D list without casting at every level.
+  /// Safe index into a nested 4-D list.
   double _idx(List out, int b, int y, int x, int c) =>
       ((out[b] as List)[y] as List)[x][c] as double;
 

@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io';
 import 'dart:typed_data';
 import 'climbing_models.dart';
+import 'annotation_painter.dart';
 
 class SaveRouteScreen extends StatefulWidget {
   final String? imagePath;
@@ -115,7 +116,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                         ),
                       // Overlay with selected holds
                       CustomPaint(
-                        painter: _RoutePreviewPainter(
+                        painter: RouteAnnotationPainter(
                           holds: widget.selectedHolds,
                           imageSize: widget.imageSize,
                         ),
@@ -130,7 +131,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 decoration: const InputDecoration(
                   labelText: 'Route Name',
                   border: OutlineInputBorder(),
-                  hintText: 'e.g., The Crimper',
+                  hintText: "e.g., Old Man's Sack",
                   prefixIcon: Icon(Icons.text_fields),
                 ),
                 textCapitalization: TextCapitalization.words,
@@ -179,8 +180,20 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                       const SizedBox(height: 8),
                       _buildSummaryRow(
                         Icons.sports_handball,
-                        'Middle Holds',
+                        'Hand/Foot Holds',
                         '${widget.selectedHolds.where((h) => h.role == HoldRole.middle).length}',
+                      ),
+                      const SizedBox(height: 8),
+                      _buildSummaryRow(
+                        Icons.sports_handball,
+                        'Hand Only Holds',
+                        '${widget.selectedHolds.where((h) => h.role == HoldRole.hand).length}',
+                      ),
+                      const SizedBox(height: 8),
+                      _buildSummaryRow(
+                        Icons.sports_handball,
+                        'Foot Only Holds',
+                        '${widget.selectedHolds.where((h) => h.role == HoldRole.foot).length}',
                       ),
                       const SizedBox(height: 8),
                       _buildSummaryRow(
@@ -251,93 +264,4 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
     _nameController.dispose();
     super.dispose();
   }
-}
-
-class _RoutePreviewPainter extends CustomPainter {
-  final List<ClimbingHold> holds;
-  final Size? imageSize;
-
-  _RoutePreviewPainter({
-    required this.holds,
-    this.imageSize,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (imageSize == null || imageSize!.width == 0 || imageSize!.height == 0) {
-      return;
-    }
-
-    // Calculate scale
-    final scaleX = size.width / imageSize!.width;
-    final scaleY = size.height / imageSize!.height;
-    final scale = scaleX < scaleY ? scaleX : scaleY;
-
-    for (int i = 0; i < holds.length; i++) {
-      final hold = holds[i];
-      final x = hold.position.dx * scale;
-      final y = hold.position.dy * scale;
-      final width = hold.width * scale;
-      final height = hold.height * scale;
-
-      // Choose color based on role
-      Color color;
-      switch (hold.role) {
-        case HoldRole.start:
-          color = Colors.green;
-          break;
-        case HoldRole.finish:
-          color = Colors.red;
-          break;
-        case HoldRole.middle:
-          color = Colors.blue;
-          break;
-      }
-
-      final paint = Paint()
-        ..color = color.withOpacity(0.7)
-        ..style = PaintingStyle.fill;
-
-      final borderPaint = Paint()
-        ..color = color
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2;
-
-      // Draw rectangle
-      final rect = Rect.fromCenter(
-        center: Offset(x, y),
-        width: width,
-        height: height,
-      );
-      canvas.drawRect(rect, paint);
-      canvas.drawRect(rect, borderPaint);
-
-      // Draw number
-      final textPainter = TextPainter(
-        text: TextSpan(
-          text: '${i + 1}',
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 10,
-            fontWeight: FontWeight.bold,
-            shadows: [
-              Shadow(
-                color: Colors.black,
-                blurRadius: 2,
-              ),
-            ],
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      );
-      textPainter.layout();
-      textPainter.paint(
-        canvas,
-        Offset(x - textPainter.width / 2, y - textPainter.height / 2),
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

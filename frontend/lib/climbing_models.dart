@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'dart:typed_data';
 
-enum HoldRole { start, middle, finish }
+enum HoldRole { start, middle, hand, foot,finish }
 
 class ClimbingHold {
   final String id;

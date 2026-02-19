@@ -88,6 +88,11 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
           _selectedImage = File(pickedFile.path);
         }
       });
+    if (_selectedImageBytes == null) {
+      print('No image selected');
+      return;
+    }
+    print('Selected image bytes length: ${_selectedImageBytes!.length}');
 
       await _detectHolds();
     } catch (e) {
@@ -134,8 +139,16 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
   }
 
   Future<void> _detectHolds() async {
+    if (_selectedImageBytes == null) {
+      print('No image selected');
+      return;
+    }
+    print('Selected image bytes length: ${_selectedImageBytes!.length}');
+
     if (_selectedImageBytes == null) return;
 
+    // Debug the CenterNet outputs once before normal detection
+    await _detectionService.debugCenterNetOutputs(_selectedImageBytes!);
     try {
       // Use bytes for detection (works on all platforms)
       final result = await _detectionService.detectHoldsFromBytes(_selectedImageBytes!);
@@ -593,6 +606,30 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     return point.dx >= left && point.dx <= right && 
            point.dy >= top && point.dy <= bottom;
   }
+  Widget _buildRoleButtonColumn(String label, HoldRole role, IconData icon, Color color) {
+    final isSelected = _detectedHolds.any((h) => h.isSelected && h.role == role);
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          for (var hold in _detectedHolds) {
+            if (hold.isSelected) hold.role = role;
+          }
+        });
+      },
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircleAvatar(
+            backgroundColor: isSelected ? color : Colors.grey[300],
+            radius: 18,
+            child: Icon(icon, color: Colors.white, size: 20),
+          ),
+          const SizedBox(height: 4),
+          Text(label, style: const TextStyle(fontSize: 12)),
+        ],
+      ),
+    );
+  }
 
   Widget _buildBottomPanel() {
     final selectedCount = _detectedHolds.where((hold) => hold.isSelected).length;
@@ -747,35 +784,16 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
           
           if (!_isEditingMode) ...[
             const SizedBox(height: 12),
-            // Hold role selector (only in selection mode)
-            Row(
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
               children: [
-                Expanded(
-                  child: _buildRoleButton(
-                    'Start',
-                    HoldRole.start,
-                    Icons.play_circle_filled,
-                    Colors.green,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildRoleButton(
-                    'Middle',
-                    HoldRole.middle,
-                    Icons.circle,
-                    Colors.blue,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildRoleButton(
-                    'Finish',
-                    HoldRole.finish,
-                    Icons.flag,
-                    Colors.red,
-                  ),
-                ),
+                _buildRoleButtonColumn('Start', HoldRole.start, Icons.play_circle_filled, Colors.green),
+                _buildRoleButtonColumn('Hand/Foot', HoldRole.middle, Icons.circle, Colors.blue),
+                _buildRoleButtonColumn('Hand Only', HoldRole.hand, Icons.circle, Colors.blue),
+                _buildRoleButtonColumn('Foot Only', HoldRole.foot, Icons.circle, Colors.blue),
+                _buildRoleButtonColumn('Finish', HoldRole.finish, Icons.flag, Colors.red),
               ],
             ),
           ],
@@ -990,6 +1008,14 @@ class HoldMarkerPainter extends CustomPainter {
             fillColor = Colors.blue.withOpacity(0.3);
             borderColor = Colors.blue;
             break;
+          case HoldRole.hand:
+            fillColor = const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
+            borderColor = Colors.blue;
+            break;
+          case HoldRole.foot:
+            fillColor = const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
+            borderColor = Colors.blue;
+            break;
         }
       } else {
         fillColor = Colors.grey.withOpacity(0.2);
@@ -1056,6 +1082,20 @@ class HoldMarkerPainter extends CustomPainter {
             canvas.drawPath(path, iconPaint);
             break;
           case HoldRole.middle:
+            canvas.drawCircle(
+              Offset(iconX + iconSize / 2, iconY + iconSize / 2),
+              iconSize / 3,
+              iconPaint,
+            );
+            break;
+          case HoldRole.hand:
+            canvas.drawCircle(
+              Offset(iconX + iconSize / 2, iconY + iconSize / 2),
+              iconSize / 3,
+              iconPaint,
+            );
+            break;
+          case HoldRole.foot:
             canvas.drawCircle(
               Offset(iconX + iconSize / 2, iconY + iconSize / 2),
               iconSize / 3,
