@@ -27,6 +27,7 @@ dependencies:
   path_provider: ^2.1.0
   share_plus: ^9.0.0
   uuid: ^4.0.0
+  collection: ^1.18.0
   
 
 dev_dependencies:
@@ -44,6 +45,8 @@ flutter:
   assets:
     - assets/model.tflite
     - assets/CJ.jpg
+    - assets/icon/foot.png
+    - assets/background.png
   
   # Uncomment if you add assets later
   # assets:

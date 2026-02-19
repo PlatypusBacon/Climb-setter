@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'climbing_models.dart';
 import 'hold_detection_service.dart';
 import 'save_route_screen.dart';
+import 'quotes.dart';
 
 class CreateRouteScreen extends StatefulWidget {
   final Function(ClimbingRoute) onRouteSaved;
@@ -22,7 +23,7 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     // modelAssetPath defaults to 'assets/model.tflite'
     // Override here if you named the file differently, e.g.:
     //   modelAssetPath: 'assets/centernet.tflite',
-    confidenceThreshold: 0.5,
+    confidenceThreshold: 0.88,
     inputSize: (width: 320, height: 320), // match your training --input-size
     numThreads: 2,
   );
@@ -88,11 +89,6 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
           _selectedImage = File(pickedFile.path);
         }
       });
-    if (_selectedImageBytes == null) {
-      print('No image selected');
-      return;
-    }
-    print('Selected image bytes length: ${_selectedImageBytes!.length}');
 
       await _detectHolds();
     } catch (e) {
@@ -148,9 +144,8 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     if (_selectedImageBytes == null) return;
 
     // Debug the CenterNet outputs once before normal detection
-    await _detectionService.debugCenterNetOutputs(_selectedImageBytes!);
+    //await _detectionService.debugCenterNetOutputs(_selectedImageBytes!);
     try {
-      // Use bytes for detection (works on all platforms)
       final result = await _detectionService.detectHoldsFromBytes(_selectedImageBytes!);
 
       final holds = result.holds.map((detected) {
@@ -245,44 +240,54 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
   }
 
   Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.photo_library_outlined,
-            size: 100,
-            color: Colors.grey[400],
+    return Container(
+      decoration: const BoxDecoration(
+        image: DecorationImage(
+          image: AssetImage('assets/background.png'),
+          fit: BoxFit.cover,
+        ),
+      ),
+      child: Center(
+        child: Container(
+          width: 220,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          decoration: BoxDecoration(
+            color: Colors.grey[300]?.withOpacity(0.85),
+            borderRadius: BorderRadius.circular(12),
           ),
-          const SizedBox(height: 24),
-          Text(
-            'Select a climbing wall image',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              ElevatedButton.icon(
-                onPressed: _selectImage,
-                icon: const Icon(Icons.photo_library),
-                label: const Text('Gallery'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              Text(
+                getRandomMessage(),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _selectImage,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  child: const Text('Gallery'),
                 ),
               ),
-              const SizedBox(width: 16),
-              ElevatedButton.icon(
-                onPressed: _takePicture,
-                icon: const Icon(Icons.camera_alt),
-                label: const Text('Camera'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _takePicture,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  child: const Text('Camera'),
                 ),
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -317,44 +322,49 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
             ),
           ),
         Expanded(
-          child: InteractiveViewer(
-            transformationController: _transformationController,
-            minScale: 0.5,
-            maxScale: 5.0,
-            boundaryMargin: const EdgeInsets.all(100),
-            panEnabled: !_isEditingMode && !_isAddingHold,
-            scaleEnabled: !_isEditingMode && !_isAddingHold,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                // Image
-                Center(
-                  child: kIsWeb || _selectedImage == null
-                      ? Image.memory(
-                          _selectedImageBytes!,
-                          fit: BoxFit.contain,
-                        )
-                      : Image.file(
-                          _selectedImage!,
-                          fit: BoxFit.contain,
-                        ),
-                ),
-                // Hold markers overlay
-                if (!_isAnalyzing && _detectedHolds.isNotEmpty)
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      return GestureDetector(
-                        onTapDown: (details) => _handleTap(details.localPosition, constraints),
-                        onPanStart: (_isEditingMode || _isAddingHold) 
-                            ? (details) => _handlePanStart(details.localPosition, constraints) 
-                            : null,
-                        onPanUpdate: (_isEditingMode || _isAddingHold) 
-                            ? (details) => _handlePanUpdate(details.localPosition, constraints) 
-                            : null,
-                        onPanEnd: (_isEditingMode || _isAddingHold) 
-                            ? (details) => _handlePanEnd() 
-                            : null,
-                        child: CustomPaint(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              // GestureDetector is OUTSIDE InteractiveViewer.
+              // Tap/drag positions are in raw viewport space, so the inverse
+              // matrix in _screenToImageCoordinates correctly undoes zoom/pan.
+              return GestureDetector(
+                onTapDown: !_isAnalyzing && _detectedHolds.isNotEmpty
+                    ? (details) => _handleTap(details.localPosition, constraints)
+                    : null,
+                onPanStart: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
+                    ? (details) => _handlePanStart(details.localPosition, constraints)
+                    : null,
+                onPanUpdate: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
+                    ? (details) => _handlePanUpdate(details.localPosition, constraints)
+                    : null,
+                onPanEnd: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
+                    ? (_) => _handlePanEnd()
+                    : null,
+                child: InteractiveViewer(
+                  transformationController: _transformationController,
+                  minScale: 0.5,
+                  maxScale: 5.0,
+                  boundaryMargin: const EdgeInsets.all(100),
+                  panEnabled: !_isEditingMode && !_isAddingHold,
+                  scaleEnabled: !_isEditingMode && !_isAddingHold,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // Image
+                      Center(
+                        child: kIsWeb || _selectedImage == null
+                            ? Image.memory(
+                                _selectedImageBytes!,
+                                fit: BoxFit.contain,
+                              )
+                            : Image.file(
+                                _selectedImage!,
+                                fit: BoxFit.contain,
+                              ),
+                      ),
+                      // Hold markers — paint only, no inner GestureDetector
+                      if (!_isAnalyzing && _detectedHolds.isNotEmpty)
+                        CustomPaint(
                           size: Size(constraints.maxWidth, constraints.maxHeight),
                           painter: HoldMarkerPainter(
                             holds: _detectedHolds,
@@ -368,29 +378,29 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
                             transformationController: _transformationController,
                           ),
                         ),
-                      );
-                    },
-                  ),
-                // Loading overlay
-                if (_isAnalyzing)
-                  Container(
-                    color: Colors.black54,
-                    child: const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          CircularProgressIndicator(color: Colors.white),
-                          SizedBox(height: 16),
-                          Text(
-                            'Analyzing holds...',
-                            style: TextStyle(color: Colors.white, fontSize: 18),
+                      // Loading overlay
+                      if (_isAnalyzing)
+                        Container(
+                          color: Colors.black54,
+                          child: const Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                CircularProgressIndicator(color: Colors.white),
+                                SizedBox(height: 16),
+                                Text(
+                                  'Analyzing holds...',
+                                  style: TextStyle(color: Colors.white, fontSize: 18),
+                                ),
+                              ],
+                            ),
                           ),
-                        ],
-                      ),
-                    ),
+                        ),
+                    ],
                   ),
-              ],
-            ),
+                ),
+              );
+            },
           ),
         ),
         _buildBottomPanel(),
@@ -420,7 +430,9 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
           // In editing mode, select hold for editing
           _editingHold = tappedHold;
         } else {
-          // In selection mode, toggle selection and role
+          // In selection mode: tap unselected hold → select it with current role
+          // tap selected hold with same role → deselect
+          // tap selected hold with different role → keep selected, update role
           if (!tappedHold!.isSelected) {
             tappedHold.isSelected = true;
             tappedHold.role = _currentSelectionMode;
@@ -544,57 +556,54 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     }
   }
 
-  Offset? _screenToImageCoordinates(Offset screenPosition, BoxConstraints constraints) {
+  Offset? _screenToImageCoordinates(Offset viewportPosition, BoxConstraints constraints) {
     if (_imageSize == null) return null;
 
-    // ── Step 1: Calculate where the image sits within the InteractiveViewer ──
+    // The GestureDetector is now OUTSIDE the InteractiveViewer, so
+    // viewportPosition is in raw viewport (unzoomed) pixel space.
+    //
+    // Pipeline:
+    //   viewport px  →  [inverse IV transform]  →  content px  →  [un-letterbox + un-scale]  →  image px
+
+    // ── Step 1: Undo the InteractiveViewer zoom/pan ──────────────────────
+    // The IV transform maps content-space → viewport-space, so we invert it.
+    final matrix        = _transformationController.value;
+    final inverseMatrix = Matrix4.inverted(matrix);
+    final contentPos    = MatrixUtils.transformPoint(inverseMatrix, viewportPosition);
+
+    // ── Step 2: Compute letterbox layout (same as HoldMarkerPainter) ─────
     final imageAspect     = _imageSize!.width / _imageSize!.height;
     final containerAspect = constraints.maxWidth / constraints.maxHeight;
-    
+
     double displayScale;
     double imageOffsetX = 0;
     double imageOffsetY = 0;
-    double displayWidth;
-    double displayHeight;
-    
+
     if (imageAspect > containerAspect) {
-      // Image is wider than container → letterbox top/bottom
-      displayScale  = constraints.maxWidth / _imageSize!.width;
-      displayWidth  = constraints.maxWidth;
-      displayHeight = _imageSize!.height * displayScale;
-      imageOffsetY  = (constraints.maxHeight - displayHeight) / 2;
+      // Wider than container → letterbox top/bottom
+      displayScale = constraints.maxWidth / _imageSize!.width;
+      final displayHeight = _imageSize!.height * displayScale;
+      imageOffsetY = (constraints.maxHeight - displayHeight) / 2;
     } else {
-      // Image is taller than container → letterbox left/right
-      displayScale  = constraints.maxHeight / _imageSize!.height;
-      displayWidth  = _imageSize!.width * displayScale;
-      displayHeight = constraints.maxHeight;
-      imageOffsetX  = (constraints.maxWidth - displayWidth) / 2;
+      // Taller than container → letterbox left/right
+      displayScale = constraints.maxHeight / _imageSize!.height;
+      final displayWidth = _imageSize!.width * displayScale;
+      imageOffsetX = (constraints.maxWidth - displayWidth) / 2;
     }
 
-    // ── Step 2: Convert screen tap to "image display space" ──
-    // Remove the letterbox offset so (0,0) is now the image top-left
-    final imageSpaceX = screenPosition.dx - imageOffsetX;
-    final imageSpaceY = screenPosition.dy - imageOffsetY;
+    // ── Step 3: Remove letterbox offset → image-display-space ────────────
+    final dispX = contentPos.dx - imageOffsetX;
+    final dispY = contentPos.dy - imageOffsetY;
 
-    // ── Step 3: Apply the inverse zoom/pan transformation ──
-    // The transformation controller's matrix operates on the image's
-    // coordinate space (after centering), so we invert it here.
-    final matrix        = _transformationController.value;
-    final inverseMatrix = Matrix4.inverted(matrix);
-    final transformed   = MatrixUtils.transformPoint(
-      inverseMatrix,
-      Offset(imageSpaceX, imageSpaceY),
+    // ── Step 4: Scale from display pixels → original image pixels ────────
+    final imageX = dispX / displayScale;
+    final imageY = dispY / displayScale;
+
+    // ── Step 5: Clamp to image bounds ────────────────────────────────────
+    return Offset(
+      imageX.clamp(0.0, _imageSize!.width),
+      imageY.clamp(0.0, _imageSize!.height),
     );
-
-    // ── Step 4: Scale from display pixels to original image pixels ──
-    final imageX = transformed.dx / displayScale;
-    final imageY = transformed.dy / displayScale;
-
-    // ── Step 5: Clamp to image bounds (optional safety) ──
-    final clampedX = imageX.clamp(0.0, _imageSize!.width);
-    final clampedY = imageY.clamp(0.0, _imageSize!.height);
-
-    return Offset(clampedX, clampedY);
   }
 
   bool _isPointInHold(Offset point, ClimbingHold hold) {
@@ -606,26 +615,49 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     return point.dx >= left && point.dx <= right && 
            point.dy >= top && point.dy <= bottom;
   }
+
+  /// Builds a role selector button. Tapping sets [_currentSelectionMode] so
+  /// that the NEXT hold the user taps on the image will be assigned this role.
+  /// The button appears highlighted when it is the active mode.
+  /// [icon] is ignored for HoldRole.foot — assets/foot.png is used instead.
   Widget _buildRoleButtonColumn(String label, HoldRole role, IconData icon, Color color) {
-    final isSelected = _detectedHolds.any((h) => h.isSelected && h.role == role);
+    final isActiveMode = _currentSelectionMode == role;
+
+    Widget iconWidget;
+    if (role == HoldRole.foot) {
+      iconWidget = Image.asset(
+        'assets/foot.png',
+        width: 20,
+        height: 20,
+        color: isActiveMode ? Colors.white : color,
+      );
+    } else {
+      iconWidget = Icon(icon, color: isActiveMode ? Colors.white : color, size: 20);
+    }
+
     return GestureDetector(
       onTap: () {
         setState(() {
-          for (var hold in _detectedHolds) {
-            if (hold.isSelected) hold.role = role;
-          }
+          _currentSelectionMode = role;
         });
       },
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           CircleAvatar(
-            backgroundColor: isSelected ? color : Colors.grey[300],
+            backgroundColor: isActiveMode ? color : Colors.grey[300],
             radius: 18,
-            child: Icon(icon, color: Colors.white, size: 20),
+            child: iconWidget,
           ),
           const SizedBox(height: 4),
-          Text(label, style: const TextStyle(fontSize: 12)),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: isActiveMode ? FontWeight.bold : FontWeight.normal,
+              color: isActiveMode ? color : Colors.black87,
+            ),
+          ),
         ],
       ),
     );
@@ -784,6 +816,7 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
           
           if (!_isEditingMode) ...[
             const SizedBox(height: 12),
+            // Role selector buttons — sets the mode for the next hold tapped
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -791,8 +824,8 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               children: [
                 _buildRoleButtonColumn('Start', HoldRole.start, Icons.play_circle_filled, Colors.green),
                 _buildRoleButtonColumn('Hand/Foot', HoldRole.middle, Icons.circle, Colors.blue),
-                _buildRoleButtonColumn('Hand Only', HoldRole.hand, Icons.circle, Colors.blue),
-                _buildRoleButtonColumn('Foot Only', HoldRole.foot, Icons.circle, Colors.blue),
+                _buildRoleButtonColumn('Hand Only', HoldRole.hand, Icons.back_hand, Colors.indigo),
+                _buildRoleButtonColumn('Foot Only', HoldRole.foot, Icons.directions_walk, Colors.purple),
                 _buildRoleButtonColumn('Finish', HoldRole.finish, Icons.flag, Colors.red),
               ],
             ),
@@ -1010,11 +1043,11 @@ class HoldMarkerPainter extends CustomPainter {
             break;
           case HoldRole.hand:
             fillColor = const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
-            borderColor = Colors.blue;
+            borderColor = Colors.indigo;
             break;
           case HoldRole.foot:
             fillColor = const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
-            borderColor = Colors.blue;
+            borderColor = Colors.purple;
             break;
         }
       } else {
@@ -1082,19 +1115,7 @@ class HoldMarkerPainter extends CustomPainter {
             canvas.drawPath(path, iconPaint);
             break;
           case HoldRole.middle:
-            canvas.drawCircle(
-              Offset(iconX + iconSize / 2, iconY + iconSize / 2),
-              iconSize / 3,
-              iconPaint,
-            );
-            break;
           case HoldRole.hand:
-            canvas.drawCircle(
-              Offset(iconX + iconSize / 2, iconY + iconSize / 2),
-              iconSize / 3,
-              iconPaint,
-            );
-            break;
           case HoldRole.foot:
             canvas.drawCircle(
               Offset(iconX + iconSize / 2, iconY + iconSize / 2),
@@ -1152,8 +1173,7 @@ class HoldMarkerPainter extends CustomPainter {
       final previewBorderPaint = Paint()
         ..color = Colors.blue
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 3
-        ..strokeDashArray = [5, 5]; // Dashed line
+        ..strokeWidth = 3;
       canvas.drawRect(previewRect, previewBorderPaint);
     }
   }

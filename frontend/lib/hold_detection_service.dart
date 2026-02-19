@@ -269,7 +269,11 @@ class HoldDetectionService {
     await _ensureInitialized();
     final cn = _centerNetIndices!;
 
-    final decoded = img.decodeImage(imageBytes)!;
+    final decoded = img.decodeImage(imageBytes);
+    if (decoded == null) {
+      print('debugCenterNetOutputs: Failed to decode image bytes');
+      return; // or throw a custom exception
+    }
     final resized = img.copyResize(decoded,
         width: inputSize.width, height: inputSize.height);
     final inputTensor = _buildInputTensor(resized);

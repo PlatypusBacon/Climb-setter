@@ -14,7 +14,7 @@ class ClimbingRouteApp extends StatelessWidget {
       title: 'Climbing Route Creator',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.deepOrange,
+          seedColor: const Color.fromARGB(255, 224, 86, 255),
           brightness: Brightness.light,
         ),
         useMaterial3: true,

@@ -28,19 +28,11 @@ class SaveRouteScreen extends StatefulWidget {
 class _SaveRouteScreenState extends State<SaveRouteScreen> {
   final _nameController = TextEditingController();
   String _selectedDifficulty = 'V0';
+  bool _isSequenceClimb = false; // new field
 
   final List<String> _difficulties = [
-    'V0',
-    'V1',
-    'V2',
-    'V3',
-    'V4',
-    'V5',
-    'V6',
-    'V7',
-    'V8',
-    'V9',
-    'V10+'
+    'V0', 'V1', 'V2', 'V3', 'V4', 'V5',
+    'V6', 'V7', 'V8', 'V9', 'V10+'
   ];
 
   void _saveRoute() {
@@ -54,11 +46,14 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
     final route = ClimbingRoute(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       name: _nameController.text,
-      imagePath: widget.imagePath ?? 'web_${DateTime.now().millisecondsSinceEpoch}',
-      imageBytes: widget.imageBytes,  // Store bytes for web
+      imagePath: widget.imagePath ??
+          'web_${DateTime.now().millisecondsSinceEpoch}',
+      imageBytes: widget.imageBytes,
+      imageSize: widget.imageSize, // pass through so detail screen can scale
       holds: widget.selectedHolds,
       createdAt: DateTime.now(),
       difficulty: _selectedDifficulty,
+      isSequenceClimb: _isSequenceClimb,
     );
 
     widget.onSave(route);
@@ -83,7 +78,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Preview of selected route
+              // Preview
               Container(
                 width: double.infinity,
                 height: 200,
@@ -114,7 +109,6 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                             child: Icon(Icons.image, size: 50),
                           ),
                         ),
-                      // Overlay with selected holds
                       CustomPaint(
                         painter: RouteAnnotationPainter(
                           holds: widget.selectedHolds,
@@ -126,6 +120,8 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 ),
               ),
               const SizedBox(height: 24),
+
+              // Route name
               TextField(
                 controller: _nameController,
                 decoration: const InputDecoration(
@@ -137,10 +133,10 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 textCapitalization: TextCapitalization.words,
               ),
               const SizedBox(height: 24),
-              Text(
-                'Difficulty',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+
+              // Difficulty
+              Text('Difficulty',
+                  style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
                 value: _selectedDifficulty,
@@ -148,29 +144,43 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                   border: OutlineInputBorder(),
                   prefixIcon: Icon(Icons.bar_chart),
                 ),
-                items: _difficulties.map((difficulty) {
-                  return DropdownMenuItem(
-                    value: difficulty,
-                    child: Text(difficulty),
-                  );
-                }).toList(),
-                onChanged: (value) {
-                  setState(() {
-                    _selectedDifficulty = value!;
-                  });
-                },
+                items: _difficulties
+                    .map((d) => DropdownMenuItem(value: d, child: Text(d)))
+                    .toList(),
+                onChanged: (value) =>
+                    setState(() => _selectedDifficulty = value!),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
+
+              // ── Sequence climb checkbox ─────────────────────────────────
+              Card(
+                child: CheckboxListTile(
+                  value: _isSequenceClimb,
+                  onChanged: (v) =>
+                      setState(() => _isSequenceClimb = v ?? false),
+                  title: const Text(
+                    'Sequence Climb',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  subtitle: const Text(
+                    'Show numbered hold order when viewing this route',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  secondary: const Icon(Icons.format_list_numbered),
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Summary card
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'Route Summary',
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
+                      Text('Route Summary',
+                          style: Theme.of(context).textTheme.titleMedium),
                       const SizedBox(height: 12),
                       _buildSummaryRow(
                         Icons.play_circle_filled,
@@ -185,13 +195,13 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                       ),
                       const SizedBox(height: 8),
                       _buildSummaryRow(
-                        Icons.sports_handball,
+                        Icons.back_hand,
                         'Hand Only Holds',
                         '${widget.selectedHolds.where((h) => h.role == HoldRole.hand).length}',
                       ),
                       const SizedBox(height: 8),
                       _buildSummaryRow(
-                        Icons.sports_handball,
+                        Icons.directions_walk,
                         'Foot Only Holds',
                         '${widget.selectedHolds.where((h) => h.role == HoldRole.foot).length}',
                       ),
@@ -203,21 +213,16 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                       ),
                       const SizedBox(height: 8),
                       _buildSummaryRow(
-                        Icons.bar_chart,
-                        'Difficulty',
-                        _selectedDifficulty,
-                      ),
+                          Icons.bar_chart, 'Difficulty', _selectedDifficulty),
                       const SizedBox(height: 8),
                       _buildSummaryRow(
-                        Icons.percent,
-                        'Avg Confidence',
-                        _getAverageConfidence(),
-                      ),
+                          Icons.percent, 'Avg Confidence', _getAverageConfidence()),
                     ],
                   ),
                 ),
               ),
               const SizedBox(height: 32),
+
               SizedBox(
                 width: double.infinity,
                 child: FilledButton(
@@ -240,10 +245,8 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
       children: [
         Icon(icon, size: 20, color: Colors.grey[600]),
         const SizedBox(width: 8),
-        Text(
-          '$label: ',
-          style: const TextStyle(fontWeight: FontWeight.w500),
-        ),
+        Text('$label: ',
+            style: const TextStyle(fontWeight: FontWeight.w500)),
         Text(value),
       ],
     );
@@ -251,11 +254,10 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
 
   String _getAverageConfidence() {
     if (widget.selectedHolds.isEmpty) return '0%';
-    
     final avg = widget.selectedHolds
-        .map((h) => h.confidence)
-        .reduce((a, b) => a + b) / widget.selectedHolds.length;
-    
+            .map((h) => h.confidence)
+            .reduce((a, b) => a + b) /
+        widget.selectedHolds.length;
     return '${(avg * 100).toInt()}%';
   }
 
