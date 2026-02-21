@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io';
-import 'climbing_models.dart';
-import 'route_model.dart';
-import 'route_database.dart';
+import 'data/climbing_models.dart';
+import 'data/route_model.dart';
+import 'data/route_database.dart';
 import 'route_detail_screen.dart';
 
 class LibraryScreen extends StatefulWidget {

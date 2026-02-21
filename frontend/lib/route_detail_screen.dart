@@ -6,7 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'climbing_models.dart';
+import 'data/climbing_models.dart';
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 

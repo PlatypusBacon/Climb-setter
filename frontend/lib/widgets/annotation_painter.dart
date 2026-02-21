@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'climbing_models.dart';
+import '../data/climbing_models.dart';
 
 class RouteAnnotationPainter extends CustomPainter {
   final List<ClimbingHold> holds;

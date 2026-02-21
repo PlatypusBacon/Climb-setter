@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io';
 import 'dart:typed_data';
-import 'climbing_models.dart';
-import 'annotation_painter.dart';
-import 'route_model.dart';
-import 'route_database.dart';
-import 'storage_service.dart';
+import 'data/climbing_models.dart';
+import 'widgets/annotation_painter.dart';
+import 'data/route_model.dart';
+import 'data/route_database.dart';
+import 'data/storage_service.dart';
 
 class SaveRouteScreen extends StatefulWidget {
   final String? imagePath;

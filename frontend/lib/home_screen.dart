@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'climbing_models.dart';
-import 'create_route.dart';
+import 'data/climbing_models.dart';
+import 'create_route/create_route.dart';
 import 'library_screen.dart';
 
 class HomeScreen extends StatefulWidget {

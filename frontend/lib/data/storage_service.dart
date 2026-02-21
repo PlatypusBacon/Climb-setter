@@ -5,7 +5,7 @@ import 'package:flutter/painting.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'climbing_models.dart';
-import 'annotation_painter.dart'; // wherever RouteAnnotationPainter lives
+import '../widgets/annotation_painter.dart'; // wherever RouteAnnotationPainter lives
 
 class RouteStorageService {
 
