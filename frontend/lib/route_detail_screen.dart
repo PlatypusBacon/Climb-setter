@@ -1,12 +1,28 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/rendering.dart';
 import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'climbing_models.dart';
+import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 
 class RouteDetailScreen extends StatefulWidget {
   final ClimbingRoute route;
 
-  const RouteDetailScreen({super.key, required this.route});
+  /// Optional callback invoked when the user deletes this route.
+  /// The parent (LibraryScreen) can listen to this to refresh its list.
+  final VoidCallback? onDeleted;
+
+  const RouteDetailScreen({
+    super.key,
+    required this.route,
+    this.onDeleted,
+  });
 
   @override
   State<RouteDetailScreen> createState() => _RouteDetailScreenState();
@@ -14,8 +30,13 @@ class RouteDetailScreen extends StatefulWidget {
 
 class _RouteDetailScreenState extends State<RouteDetailScreen> {
   final GlobalKey _stackKey = GlobalKey();
+
+  /// Key wrapping only the image + hold-overlay Stack — used for export.
+  final GlobalKey _repaintKey = GlobalKey();
+
   Size? _displayedImageRect;
   Offset? _displayedImageOffset;
+  bool _isExporting = false;
 
   @override
   void initState() {
@@ -23,8 +44,6 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _computeImageLayout());
   }
 
-  /// Works out where the image actually sits inside the 400-px-tall Stack,
-  /// given that Image uses BoxFit.contain (letterboxed).
   void _computeImageLayout() {
     final imageSize = widget.route.imageSize;
     final ctx = _stackKey.currentContext;
@@ -38,7 +57,6 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     final cntW = containerSize.width;
     final cntH = containerSize.height;
 
-    // BoxFit.contain: uniform scale so the whole image fits
     final scale = (cntW / imgW) < (cntH / imgH)
         ? (cntW / imgW)
         : (cntH / imgH);
@@ -55,6 +73,89 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     });
   }
 
+  // ── Delete ────────────────────────────────────────────────────────────────
+
+  Future<void> _confirmDelete() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Route'),
+        content: Text('Delete "${widget.route.name}"? This cannot be undone.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child:
+                const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      widget.onDeleted?.call();
+      Navigator.pop(context); // return to library
+    }
+  }
+
+  // ── Export ────────────────────────────────────────────────────────────────
+
+  Future<void> _shareImage() async {
+    setState(() => _isExporting = true);
+
+    try {
+      // Capture the RepaintBoundary widget as a ui.Image
+      final boundary = _repaintKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary == null) throw Exception('Could not find render boundary');
+
+      // Use a higher pixel ratio for a crisper export (2× = "retina")
+      final ui.Image image = await boundary.toImage(pixelRatio: 2.0);
+      final ByteData? byteData =
+          await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) throw Exception('Failed to encode image');
+
+      final pngBytes = byteData.buffer.asUint8List();
+
+      if (kIsWeb) {
+        // On web there is no writable filesystem; fall back to share sheet.
+        await Share.shareXFiles(
+          [XFile.fromData(pngBytes, mimeType: 'image/png', name: '${widget.route.name}.png')],
+          subject: widget.route.name,
+        );
+      } else {
+        // Write to a temp file, then share (share sheet includes Print on iOS).
+        final dir = await getTemporaryDirectory();
+        final safeName = widget.route.name
+            .replaceAll(RegExp(r'[^\w\s-]'), '')
+            .replaceAll(' ', '_');
+        final file = File('${dir.path}/${safeName}_route.png');
+        await file.writeAsBytes(pngBytes);
+
+        await Share.shareXFiles(
+          [XFile(file.path)],
+          subject: widget.route.name,
+          text: 'Climbing route: ${widget.route.name} — ${widget.route.difficulty}',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Export failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
+    }
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     final route = widget.route;
@@ -63,23 +164,70 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
       appBar: AppBar(
         title: Text(route.name),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          // Export button
+          _isExporting
+              ? const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                )
+              : IconButton(
+                  icon: const Icon(Icons.ios_share),
+                  tooltip: 'Export / Print',
+                  onPressed: _shareImage,
+                ),
+          // Delete button
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete route',
+            color: Colors.red[400],
+            onPressed: _confirmDelete,
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // ── Image + hold overlay ──────────────────────────────────────
-            SizedBox(
-              width: double.infinity,
-              height: 400,
-              child: Stack(
-                key: _stackKey,
-                children: [
-                  Positioned.fill(child: _buildImage(route)),
-                  if (_displayedImageRect != null &&
-                      _displayedImageOffset != null)
-                    ..._buildHoldMarkers(route),
-                ],
+            // ── Image + hold overlay (also the export target) ─────────────
+            RepaintBoundary(
+              key: _repaintKey,
+              child: SizedBox(
+                width: double.infinity,
+                height: 400,
+                child: Stack(
+                  key: _stackKey,
+                  children: [
+                    Positioned.fill(child: _buildImage(route)),
+                    if (_displayedImageRect != null &&
+                        _displayedImageOffset != null)
+                      ..._buildHoldMarkers(route),
+                    // Route name watermark — included in the export
+                    Positioned(
+                      bottom: 8,
+                      left: 10,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          '${route.name}  •  ${route.difficulty}',
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
 
@@ -126,13 +274,23 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
                       _getAverageConfidence()),
                   const SizedBox(height: 24),
 
-                  // ── Hold Sequence — only shown for sequence climbs ───────
+                  // ── Export hint ──────────────────────────────────────────
+                  OutlinedButton.icon(
+                    onPressed: _isExporting ? null : _saveImageToDevice,
+                    icon: const Icon(Icons.download),
+                    label: const Text('save annotated image to device for printing'),
+                  ),
+                  const SizedBox(height: 24),
+
+                  // ── Hold Sequence ────────────────────────────────────────
                   if (route.isSequenceClimb) ...[
                     Text('Hold Sequence',
                         style: Theme.of(context).textTheme.titleLarge),
                     const SizedBox(height: 12),
-                    ...route.holds.asMap().entries.map(
-                        (e) => _buildSequenceRow(e.key, e.value)),
+                    ...route.holds
+                        .asMap()
+                        .entries
+                        .map((e) => _buildSequenceRow(e.key, e.value)),
                   ],
                 ],
               ),
@@ -143,14 +301,12 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     );
   }
 
-  // ── Hold overlay ────────────────────────────────────────────────────────
+  // ── Hold overlay ──────────────────────────────────────────────────────────
 
   List<Widget> _buildHoldMarkers(ClimbingRoute route) {
     final imgSize = route.imageSize!;
     final dispSize = _displayedImageRect!;
     final offset = _displayedImageOffset!;
-
-    // Pixels-per-original-pixel
     final scale = dispSize.width / imgSize.width;
 
     return route.holds.asMap().entries.map((entry) {
@@ -194,7 +350,7 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     }).toList();
   }
 
-  // ── Sequence list ───────────────────────────────────────────────────────
+  // ── Sequence list ─────────────────────────────────────────────────────────
 
   Widget _buildSequenceRow(int index, ClimbingHold hold) {
     final color = _roleColor(hold.role);
@@ -204,7 +360,6 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
       padding: const EdgeInsets.only(bottom: 12),
       child: Row(
         children: [
-          // Number bubble
           Container(
             width: 40,
             height: 40,
@@ -242,9 +397,9 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
               ],
             ),
           ),
-          // Confidence badge
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
               color: _getConfidenceColor(hold.confidence),
               borderRadius: BorderRadius.circular(12),
@@ -262,7 +417,7 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     );
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
   Widget _buildImage(ClimbingRoute route) {
     if (route.imageBytes != null) {
@@ -325,15 +480,10 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     }
   }
 
-  /// Foot role uses assets/foot.png; all others use Material icons.
   Widget _roleIconWidget(HoldRole role, Color color, {double size = 20}) {
     if (role == HoldRole.foot) {
-      return Image.asset(
-        'assets/foot.png',
-        width: size,
-        height: size,
-        color: color,
-      );
+      return Image.asset('assets/foot.png',
+          width: size, height: size, color: color);
     }
     final IconData icon;
     switch (role) {
@@ -360,8 +510,7 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
       children: [
         Icon(icon, size: 20, color: Colors.grey[600]),
         const SizedBox(width: 12),
-        Text('$label: ',
-            style: const TextStyle(fontWeight: FontWeight.w500)),
+        Text('$label: ', style: const TextStyle(fontWeight: FontWeight.w500)),
         Text(value),
       ],
     );
@@ -383,5 +532,65 @@ class _RouteDetailScreenState extends State<RouteDetailScreen> {
     if (confidence >= 0.8) return Colors.green;
     if (confidence >= 0.6) return Colors.orange;
     return Colors.red;
+  }
+  Future<void> _saveImageToDevice() async {
+    setState(() => _isExporting = true);
+
+    try {
+      final boundary = _repaintKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary == null) throw Exception('Could not find render boundary');
+
+      final ui.Image image = await boundary.toImage(pixelRatio: 2.0);
+      final ByteData? byteData =
+          await image.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) throw Exception('Failed to encode image');
+
+      final pngBytes = byteData.buffer.asUint8List();
+
+      if (!kIsWeb) {
+        // Android permission handling
+        PermissionStatus status;
+
+        if (Platform.isAndroid) {
+          // Android 13+
+          status = await Permission.photos.request();
+        } else {
+          // Older Android / iOS
+          status = await Permission.storage.request();
+        }
+
+        if (!status.isGranted) {
+          throw Exception('Permission denied');
+        }
+
+        final result = await ImageGallerySaverPlus.saveImage(
+          pngBytes,
+          quality: 100,
+          name: widget.route.name.replaceAll(' ', '_'),
+        );
+
+        if (result == null || result['isSuccess'] != true) {
+          throw Exception('Save failed');
+        }
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Image saved to device')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Save failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
+    }
   }
 }

@@ -30,7 +30,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final List<Widget> screens = [
       CreateRouteScreen(onRouteSaved: _addRoute),
-      LibraryScreen(routes: _savedRoutes),
+      LibraryScreen(),
     ];
 
     return Scaffold(

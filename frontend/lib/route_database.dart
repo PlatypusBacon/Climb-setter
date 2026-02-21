@@ -29,7 +29,8 @@ class RouteDatabase {
           annotated_image_path TEXT,
           created_at TEXT NOT NULL,
           image_width REAL NOT NULL,
-          image_height REAL NOT NULL
+          image_height REAL NOT NULL,
+          is_sequence_climb INTEGER NOT NULL DEFAULT 0
         )
       '''),
     );

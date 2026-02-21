@@ -93,6 +93,12 @@ class HoldDetectionService {
   /// Number of threads for inference. 2–4 is a good default on mobile.
   final int numThreads;
 
+  /// IoU threshold for Non-Maximum Suppression.
+  /// Lower = more aggressive duplicate removal.
+  /// 0.30 is a reasonable default for well-separated holds;
+  /// lower to ~0.10 if the model produces many overlapping boxes.
+  final double nmsIouThreshold;
+
   IsolateInterpreter? _isolateInterpreter;
   Interpreter?        _interpreter;
   bool                _initialized = false;
@@ -106,6 +112,7 @@ class HoldDetectionService {
     this.confidenceThreshold = 0.7,
     this.inputSize           = (width: 320, height: 320),
     this.numThreads          = 2,
+    this.nmsIouThreshold     = 0.10,
     // Ignored — kept for API compatibility with the old HTTP service
     String? baseUrl,
   });
@@ -139,13 +146,11 @@ class HoldDetectionService {
       final t = _interpreter!.getOutputTensor(i);
       log('[HoldDetection] Output $i: "${t.name}" shape=${t.shape}');
 
-      // CenterNet outputs are all [1, oH, oW, C] where oH==oW (e.g. 80×80)
       if (t.shape.length == 4 && t.shape[1] == t.shape[2]) {
         final h = t.shape[1];
         final w = t.shape[2];
         final c = t.shape[3];
 
-        // In _ensureInitialized, replace the c==2 block:
         if (c == 1 && heatmapIdx == null) {
           heatmapIdx = i; oH = h; oW = w;
         } else if (c == 2) {
@@ -155,9 +160,9 @@ class HoldDetectionService {
           } else if ((name.contains('offset') || name.contains('off')) && offsetIdx == null) {
             offsetIdx = i;
           } else if (whIdx == null) {
-            whIdx = i;      // fallback: first c==2 tensor
+            whIdx = i;
           } else if (offsetIdx == null) {
-            offsetIdx = i;  // fallback: second c==2 tensor
+            offsetIdx = i;
           }
         }
       }
@@ -236,8 +241,6 @@ class HoldDetectionService {
     final oH  = cn.outputH;
     final oW  = cn.outputW;
 
-    // Allocate nested-list output buffers — tflite_flutter fills these in-place.
-    // Each must exactly match the tensor shape: [1, oH, oW, C].
     final hmOut = List.generate(1, (_) =>
         List.generate(oH, (_) =>
         List.generate(oW, (_) => List<double>.filled(1, 0.0))));
@@ -272,7 +275,7 @@ class HoldDetectionService {
     final decoded = img.decodeImage(imageBytes);
     if (decoded == null) {
       print('debugCenterNetOutputs: Failed to decode image bytes');
-      return; // or throw a custom exception
+      return;
     }
     final resized = img.copyResize(decoded,
         width: inputSize.width, height: inputSize.height);
@@ -291,7 +294,6 @@ class HoldDetectionService {
       cn.offsetIdx:  offOut,
     });
 
-    // Flatten heatmap to find global max/min/mean
     double maxConf = 0, sum = 0;
     int count = 0;
     int peaksAbove01 = 0, peaksAbove05 = 0;
@@ -327,7 +329,8 @@ class HoldDetectionService {
         final conf = (hmOut[0][y][x][0] as num).toDouble();
         if (conf < confidenceThreshold) continue;
 
-        // 3×3 local-maximum suppression — keeps only peak heatmap responses.
+        // 3×3 local-maximum suppression on the heatmap itself.
+        // This removes adjacent heatmap cells that belong to the same peak.
         bool isLocalMax = true;
         for (var dy = -1; dy <= 1 && isLocalMax; dy++) {
           for (var dx = -1; dx <= 1 && isLocalMax; dx++) {
@@ -359,7 +362,17 @@ class HoldDetectionService {
       }
     }
 
-    return _nms(results);
+    // Log pre-NMS count to help diagnose suppression issues
+    log('[HoldDetection] Pre-NMS candidates: ${results.length}  '
+        'IoU threshold: $nmsIouThreshold');
+
+    //final after = _nms(results, iouThreshold: nmsIouThreshold);
+    final after = _wbf(results, iouThreshold: nmsIouThreshold);
+
+    log('[HoldDetection] Post-NMS detections: ${after.length}  '
+        '(removed ${results.length - after.length})');
+
+    return after;
   }
 
   // ── SSD / EfficientDet inference ────────────────────────────────────────
@@ -391,7 +404,17 @@ class HoldDetectionService {
         _decodeAnchorScale(outputs[i]!, shape, origW: origW, origH: origH),
       );
     }
-    return _nms(all);
+
+    log('[HoldDetection] Pre-NMS candidates: ${all.length}  '
+        'IoU threshold: $nmsIouThreshold');
+
+    //final after = _nms(all, iouThreshold: nmsIouThreshold);
+    final after = _wbf(all, iouThreshold: nmsIouThreshold);
+
+    log('[HoldDetection] Post-NMS detections: ${after.length}  '
+        '(removed ${all.length - after.length})');
+
+    return after;
   }
 
   List<DetectedHold> _decodeAnchorScale(
@@ -399,10 +422,9 @@ class HoldDetectionService {
     required int origW, required int origH,
     int numAnchors = 6,
   }) {
-    // shape: [1, gH, gW, numAnchors*(5+numClasses)]
     final gH         = shape[1];
     final gW         = shape[2];
-    final innerSize  = shape[3]; // should be numAnchors * (5 + numClasses)
+    final innerSize  = shape[3];
     final numClasses = (innerSize ~/ numAnchors) - 5;
 
     if (numClasses < 1) {
@@ -451,8 +473,13 @@ class HoldDetectionService {
 
   // ── NMS ─────────────────────────────────────────────────────────────────
 
-  List<DetectedHold> _nms(List<DetectedHold> detections,
-      {double iouThreshold = 0.30}) {
+  /// Standard greedy NMS. Sorted by confidence descending; any box with
+  /// IoU > [iouThreshold] against an already-kept box is suppressed.
+  List<DetectedHold> _nms(
+    List<DetectedHold> detections, {
+    double? iouThreshold,
+  }) {
+    final threshold = iouThreshold ?? nmsIouThreshold;
     if (detections.isEmpty) return [];
 
     final sorted = List<DetectedHold>.from(detections)
@@ -466,7 +493,8 @@ class HoldDetectionService {
       kept.add(sorted[i]);
       for (var j = i + 1; j < sorted.length; j++) {
         if (suppressed[j]) continue;
-        if (_iou(sorted[i].bbox, sorted[j].bbox) > iouThreshold) {
+        final iou = _iou(sorted[i].bbox, sorted[j].bbox);
+        if (iou > threshold) {
           suppressed[j] = true;
         }
       }
@@ -510,23 +538,103 @@ class HoldDetectionService {
     }
   }
 
-  /// Recursively allocate a nested Dart list matching [shape].
   Object _allocateBuffer(List<int> shape) {
     if (shape.length == 1) return List<double>.filled(shape[0], 0.0);
     return List.generate(shape[0], (_) => _allocateBuffer(shape.sublist(1)));
   }
 
-  /// Safe index into a nested 4-D list.
   double _idx(List out, int b, int y, int x, int c) =>
       ((out[b] as List)[y] as List)[x][c] as double;
 
   static double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
-  // ── Cleanup ──────────────────────────────────────────────────────────────
-
   void dispose() {
     _isolateInterpreter?.close();
     _interpreter?.close();
     _initialized = false;
+  }
+
+  //-- WBF --------------------------------
+  // Weighted Boxes fusion, testing instead of NMS
+  List<DetectedHold> _wbf(
+    List<DetectedHold> detections, {
+    double? iouThreshold,
+  }) {
+    final threshold = iouThreshold ?? nmsIouThreshold;
+    if (detections.isEmpty) return [];
+
+    // Sort by confidence (high first)
+    final sorted = List<DetectedHold>.from(detections)
+      ..sort((a, b) => b.confidence.compareTo(a.confidence));
+
+    final clusters = <List<DetectedHold>>[];
+
+    // Step 1: group boxes into clusters based on IoU
+    for (final det in sorted) {
+      bool added = false;
+
+      for (final cluster in clusters) {
+        // Compare with cluster representative (first box)
+        final iou = _iou(det.bbox, cluster.first.bbox);
+        if (iou > threshold) {
+          cluster.add(det);
+          added = true;
+          break;
+        }
+      }
+
+      if (!added) {
+        clusters.add([det]);
+      }
+    }
+
+    // Step 2: fuse each cluster into one box
+    final fused = <DetectedHold>[];
+
+    for (final cluster in clusters) {
+      double sumW = 0;
+
+      double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+
+      for (final det in cluster) {
+        final b = det.bbox;
+
+        // --- Weight choice ---
+        // Option A: confidence only
+        // final w = det.confidence;
+
+        // Option B: confidence * area (recommended for your use case)
+        final area = (b.x2 - b.x1) * (b.y2 - b.y1);
+        final w = det.confidence * area;
+
+        sumW += w;
+
+        x1 += b.x1 * w;
+        y1 += b.y1 * w;
+        x2 += b.x2 * w;
+        y2 += b.y2 * w;
+      }
+
+      if (sumW == 0) continue;
+
+      final fusedBox = BoundingBox(
+        x1 / sumW,
+        y1 / sumW,
+        x2 / sumW,
+        y2 / sumW,
+      );
+
+      // Confidence: average or max
+      final fusedConf = cluster
+          .map((d) => d.confidence)
+          .reduce((a, b) => a + b) / cluster.length;
+
+      fused.add(DetectedHold(
+        bbox: fusedBox,
+        confidence: fusedConf,
+      ));
+    }
+
+    return fused;
   }
 }

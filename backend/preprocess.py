@@ -62,6 +62,6 @@ def convert_via_to_training(via_json_path, output_dir):
 
         print(f"Converted {filename}")
 if __name__ == "__main__":
-    via_json_path = "data/VIA_browser_cache_Sun Feb 15 2026 17_42_47 GMT+1000 (Australian Eastern Standard Time).json"
+    via_json_path = "data/threemore.json"
     output_dir = "data/label/test"
     convert_via_to_training(via_json_path, output_dir)

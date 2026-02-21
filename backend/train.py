@@ -647,7 +647,6 @@ def train_tf_model(model, records, output_dir,
 
             # Always augment — essential for generalisation on small datasets.
             img, boxes = augment_climbing_image(img, boxes, img_size=IMG_SIZE)
-
             img_t = tf.convert_to_tensor(img[np.newaxis], dtype=tf.float32)
 
             if boxes:

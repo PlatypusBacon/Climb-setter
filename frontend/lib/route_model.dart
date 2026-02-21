@@ -1,26 +1,21 @@
 import 'dart:convert';
-import 'package:flutter/painting.dart';
 import 'climbing_models.dart';
+import 'package:flutter/painting.dart';
 
-class SavedRoute {
-  final String id;
-  final String name;
-  final String difficulty;
-  final List<ClimbingHold> holds;
-  final String imagePath;
+class SavedRoute extends ClimbingRoute {
   final String? annotatedImagePath;
-  final DateTime createdAt;
-  final Size imageSize;
 
   SavedRoute({
-    required this.id,
-    required this.name,
-    required this.difficulty,
-    required this.holds,
-    required this.imagePath,
+    required super.id,
+    required super.name,
+    required super.imagePath,
+    super.imageBytes,
+    super.imageSize,
+    required super.holds,
+    required super.createdAt,
+    super.difficulty,
+    super.isSequenceClimb,
     this.annotatedImagePath,
-    required this.createdAt,
-    required this.imageSize,
   });
 
   Map<String, dynamic> toMap() => {
@@ -31,8 +26,9 @@ class SavedRoute {
     'image_path': imagePath,
     'annotated_image_path': annotatedImagePath,
     'created_at': createdAt.toIso8601String(),
-    'image_width': imageSize.width,
-    'image_height': imageSize.height,
+    'image_width': imageSize?.width ?? 0,
+    'image_height': imageSize?.height ?? 0,
+    'is_sequence_climb': isSequenceClimb ? 1 : 0,
   };
 
   factory SavedRoute.fromMap(Map<String, dynamic> map) => SavedRoute(
@@ -46,5 +42,6 @@ class SavedRoute {
     annotatedImagePath: map['annotated_image_path'],
     createdAt: DateTime.parse(map['created_at']),
     imageSize: Size(map['image_width'], map['image_height']),
+    isSequenceClimb: map['is_sequence_climb'] == 1,
   );
 }

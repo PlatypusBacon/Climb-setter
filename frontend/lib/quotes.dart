@@ -11,14 +11,18 @@ const List<String> messages = [
   "Why are you running away?",
   "And I dont need no drugs to calm me.",
   "All in all it was all just bricks in the wall.",
-  "He could not break free.\n And the worms ate into his brain."
+  "No matter how he tried, He could not break free.\n And the worms ate into his brain.",
   "Got those swollen hand blues.",
+  "All you need to do is follow the worms.",
+  "The prisoner who now stands before you was caught red-handed showing feelings\n Showing feelings of an almost human nature; \nThis will not do.",
+  "They must have taken my marbles away.",
   "There is no pain you are receding",
   "Are there any queers in the theater tonight?",
   "If I had my way, I'd have all of you shot!",
   "'Go on Judge! Shit on him!'",
   "Tear down the wall!",
   "Some stagger and fall, after all it's not easy\n Banging your heart against some mad bugger's wall.",
+  "This Roman Meal bakery thought you'd like to know.",
 ];
 
 final Random _random = Random();

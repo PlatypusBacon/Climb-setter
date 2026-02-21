@@ -1,3 +1,4 @@
+// Updated: NMS moved entirely into hold_detection_service.dart
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:image_picker/image_picker.dart';
@@ -18,18 +19,14 @@ class CreateRouteScreen extends StatefulWidget {
 }
 
 class _CreateRouteScreenState extends State<CreateRouteScreen> {
-  // Automatically use correct URL based on platform
   final HoldDetectionService _detectionService = HoldDetectionService(
-    // modelAssetPath defaults to 'assets/model.tflite'
-    // Override here if you named the file differently, e.g.:
-    //   modelAssetPath: 'assets/centernet.tflite',
-    confidenceThreshold: 0.88,
-    inputSize: (width: 320, height: 320), // match your training --input-size
+    confidenceThreshold: 0.755,
+    inputSize: (width: 320, height: 320),
     numThreads: 2,
   );
 
   File? _selectedImage;
-  Uint8List? _selectedImageBytes;  // For web platform
+  Uint8List? _selectedImageBytes;
   List<ClimbingHold> _detectedHolds = [];
   bool _isAnalyzing = false;
   String? _errorMessage;
@@ -41,8 +38,13 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
   String? _editingAction; // 'move', 'resize'
   Offset? _lastDragPosition;
   Offset? _newHoldStart;
-  
-  final TransformationController _transformationController = TransformationController();
+
+  // True only when a single-finger gesture started ON a hold (edit/add).
+  // Multi-finger gestures always set this false so the IV handles zoom.
+  bool _panIsEditGesture = false;
+
+  final TransformationController _transformationController =
+      TransformationController();
   final ImagePicker _picker = ImagePicker();
 
   @override
@@ -71,7 +73,6 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         maxWidth: 2048,
         maxHeight: 2048,
       );
-
       if (pickedFile == null) return;
 
       setState(() {
@@ -80,14 +81,10 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         _detectedHolds = [];
       });
 
-      // Read image bytes (works on all platforms)
       final bytes = await pickedFile.readAsBytes();
-      
       setState(() {
         _selectedImageBytes = bytes;
-        if (!kIsWeb) {
-          _selectedImage = File(pickedFile.path);
-        }
+        if (!kIsWeb) _selectedImage = File(pickedFile.path);
       });
 
       await _detectHolds();
@@ -106,7 +103,6 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         maxWidth: 2048,
         maxHeight: 2048,
       );
-
       if (pickedFile == null) return;
 
       setState(() {
@@ -115,14 +111,10 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         _detectedHolds = [];
       });
 
-      // Read image bytes (works on all platforms)
       final bytes = await pickedFile.readAsBytes();
-      
       setState(() {
         _selectedImageBytes = bytes;
-        if (!kIsWeb) {
-          _selectedImage = File(pickedFile.path);
-        }
+        if (!kIsWeb) _selectedImage = File(pickedFile.path);
       });
 
       await _detectHolds();
@@ -134,29 +126,64 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     }
   }
 
-  Future<void> _detectHolds() async {
-    if (_selectedImageBytes == null) {
-      print('No image selected');
-      return;
-    }
-    print('Selected image bytes length: ${_selectedImageBytes!.length}');
+  // ---------------------------------------------------------------------------
+  // NMS (secondary pass on top of service-level NMS)
+  // ---------------------------------------------------------------------------
+  List<ClimbingHold> _applyNMS(List<ClimbingHold> holds,
+      {double overlapThreshold = 0.70}) {
+    final sorted = [...holds]
+      ..sort((a, b) => (b.width * b.height).compareTo(a.width * a.height));
 
+    final kept = <ClimbingHold>[];
+    for (final candidate in sorted) {
+      bool suppressed = false;
+      for (final keeper in kept) {
+        final intersection = _intersectionArea(candidate, keeper);
+        final area = candidate.width * candidate.height;
+        if (area > 0 && intersection / area >= overlapThreshold) {
+          suppressed = true;
+          break;
+        }
+      }
+      if (!suppressed) kept.add(candidate);
+    }
+    return kept;
+  }
+
+  double _intersectionArea(ClimbingHold a, ClimbingHold b) {
+    final w = (a.position.dx + a.width / 2 < b.position.dx + b.width / 2
+            ? a.position.dx + a.width / 2
+            : b.position.dx + b.width / 2) -
+        (a.position.dx - a.width / 2 > b.position.dx - b.width / 2
+            ? a.position.dx - a.width / 2
+            : b.position.dx - b.width / 2);
+    final h = (a.position.dy + a.height / 2 < b.position.dy + b.height / 2
+            ? a.position.dy + a.height / 2
+            : b.position.dy + b.height / 2) -
+        (a.position.dy - a.height / 2 > b.position.dy - b.height / 2
+            ? a.position.dy - a.height / 2
+            : b.position.dy - b.height / 2);
+    return (w > 0 && h > 0) ? w * h : 0.0;
+  }
+
+  Future<void> _detectHolds() async {
     if (_selectedImageBytes == null) return;
 
-    // Debug the CenterNet outputs once before normal detection
-    //await _detectionService.debugCenterNetOutputs(_selectedImageBytes!);
     try {
-      final result = await _detectionService.detectHoldsFromBytes(_selectedImageBytes!);
+      final result =
+          await _detectionService.detectHoldsFromBytes(_selectedImageBytes!);
 
-      final holds = result.holds.map((detected) {
+      final rawHolds = result.holds.map((detected) {
         return ClimbingHold(
-          id: 'hold_${detected.center.x}_${detected.center.y}',
+          id: 'hold_${detected.center.x.toInt()}_${detected.center.y.toInt()}',
           position: Offset(detected.center.x, detected.center.y),
           confidence: detected.confidence,
           width: detected.bbox.width,
           height: detected.bbox.height,
         );
       }).toList();
+
+      final holds = _applyNMS(rawHolds, overlapThreshold: 0.70);
 
       setState(() {
         _detectedHolds = holds;
@@ -169,9 +196,11 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
       });
 
       if (mounted) {
+        final removed = rawHolds.length - holds.length;
+        final suffix = removed > 0 ? ' ($removed overlapping removed)' : '';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Detected ${holds.length} climbing holds!'),
+            content: Text('Detected ${holds.length} climbing holds!$suffix'),
             backgroundColor: Colors.green,
           ),
         );
@@ -181,13 +210,12 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         _errorMessage = 'Detection failed: $e';
         _isAnalyzing = false;
       });
-
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Detection failed: $e'),
             backgroundColor: Colors.red,
-            duration: Duration(seconds: 5),
+            duration: const Duration(seconds: 5),
           ),
         );
       }
@@ -195,8 +223,8 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
   }
 
   void _createRoute() {
-    final selectedHolds = _detectedHolds.where((hold) => hold.isSelected).toList();
-
+    final selectedHolds =
+        _detectedHolds.where((hold) => hold.isSelected).toList();
     if (selectedHolds.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please select at least one hold')),
@@ -251,26 +279,19 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         child: Container(
           width: 220,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-          decoration: BoxDecoration(
-            color: Colors.grey[300]?.withOpacity(0.85),
-            borderRadius: BorderRadius.circular(12),
-          ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(
-                getRandomMessage(),
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+              Text(getRandomMessage(),
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 20),
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
                   onPressed: _selectImage,
                   style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                  ),
+                      padding: const EdgeInsets.symmetric(vertical: 14)),
                   child: const Text('Gallery'),
                 ),
               ),
@@ -280,8 +301,7 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
                 child: ElevatedButton(
                   onPressed: _takePicture,
                   style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                  ),
+                      padding: const EdgeInsets.symmetric(vertical: 14)),
                   child: const Text('Camera'),
                 ),
               ),
@@ -305,18 +325,11 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
                 const Icon(Icons.error_outline, color: Colors.red),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text(
-                    _errorMessage!,
-                    style: const TextStyle(color: Colors.red),
-                  ),
-                ),
+                    child: Text(_errorMessage!,
+                        style: const TextStyle(color: Colors.red))),
                 IconButton(
                   icon: const Icon(Icons.close, color: Colors.red),
-                  onPressed: () {
-                    setState(() {
-                      _errorMessage = null;
-                    });
-                  },
+                  onPressed: () => setState(() => _errorMessage = null),
                 ),
               ],
             ),
@@ -324,52 +337,91 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              // GestureDetector is OUTSIDE InteractiveViewer.
-              // Tap/drag positions are in raw viewport space, so the inverse
-              // matrix in _screenToImageCoordinates correctly undoes zoom/pan.
+              // ── Gesture routing strategy ─────────────────────────────────
+              //
+              // ROOT CAUSE of broken pinch-to-zoom:
+              //   GestureDetector(onPan*) wins the gesture arena over
+              //   InteractiveViewer for ALL gestures, including pinch.
+              //
+              // FIX: Replace onPan* with onScale*.
+              //   ScaleStartDetails.pointerCount distinguishes finger count:
+              //     1 finger on a hold  → edit gesture (we handle movement)
+              //     1 finger on space   → _panIsEditGesture=false, IV pans
+              //     2+ fingers (pinch)  → _panIsEditGesture=false, IV zooms
+              //
+              // When _panIsEditGesture is false, onScaleUpdate is a no-op,
+              // so the InteractiveViewer processes the event unobstructed.
+
+              // ── Gesture routing ──────────────────────────────────────
+              // Two modes need different recognizers:
+              //
+              // ADD mode  (IV disabled):
+              //   onPan* — reliable single-finger drag for box drawing.
+              //   No conflict with IV since it is disabled.
+              //
+              // EDIT / SELECT mode (IV enabled):
+              //   onScale* — single-finger for hold move/resize,
+              //   multi-finger passes through to IV for pinch-zoom.
+              //
+              // A GestureDetector cannot have both onPan* and onScale*
+              // simultaneously, so we switch based on mode.
+
               return GestureDetector(
                 onTapDown: !_isAnalyzing && _detectedHolds.isNotEmpty
-                    ? (details) => _handleTap(details.localPosition, constraints)
+                    ? (d) => _handleTap(d.localPosition, constraints)
                     : null,
-                onPanStart: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
-                    ? (details) => _handlePanStart(details.localPosition, constraints)
+
+                // ── Pan callbacks: used ONLY in add-hold mode ─────────────
+                onPanStart: _isAddingHold && !_isAnalyzing
+                    ? (d) => _handlePanStart(d.localPosition, constraints)
                     : null,
-                onPanUpdate: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
-                    ? (details) => _handlePanUpdate(details.localPosition, constraints)
+                onPanUpdate: _isAddingHold && !_isAnalyzing
+                    ? (d) => _handlePanUpdate(d.localPosition, constraints)
                     : null,
-                onPanEnd: !_isAnalyzing && _detectedHolds.isNotEmpty && (_isEditingMode || _isAddingHold)
-                    ? (_) => _handlePanEnd()
+                onPanEnd: _isAddingHold && !_isAnalyzing
+                    ? (_) => _handleScaleEnd()
                     : null,
+
+                // ── Scale callbacks: used in edit/select mode ─────────────
+                onScaleStart: !_isAddingHold && !_isAnalyzing && _detectedHolds.isNotEmpty
+                    ? (d) => _handleScaleStart(d, constraints)
+                    : null,
+                onScaleUpdate: !_isAddingHold && !_isAnalyzing && _detectedHolds.isNotEmpty
+                    ? (d) => _handleScaleUpdate(d, constraints)
+                    : null,
+                onScaleEnd: !_isAddingHold && !_isAnalyzing && _detectedHolds.isNotEmpty
+                    ? (_) => _handleScaleEnd()
+                    : null,
+
+                behavior: HitTestBehavior.translucent,
+
                 child: InteractiveViewer(
                   transformationController: _transformationController,
                   minScale: 0.5,
                   maxScale: 5.0,
                   boundaryMargin: const EdgeInsets.all(100),
-                  panEnabled: !_isEditingMode && !_isAddingHold,
-                  scaleEnabled: !_isEditingMode && !_isAddingHold,
+                  // Disabled while adding a hold so GestureDetector owns all touches
+                  panEnabled: !_isAddingHold,
+                  scaleEnabled: !_isAddingHold,
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      // Image
                       Center(
                         child: kIsWeb || _selectedImage == null
-                            ? Image.memory(
-                                _selectedImageBytes!,
-                                fit: BoxFit.contain,
-                              )
-                            : Image.file(
-                                _selectedImage!,
-                                fit: BoxFit.contain,
-                              ),
+                            ? Image.memory(_selectedImageBytes!,
+                                fit: BoxFit.contain)
+                            : Image.file(_selectedImage!,
+                                fit: BoxFit.contain),
                       ),
-                      // Hold markers — paint only, no inner GestureDetector
                       if (!_isAnalyzing && _detectedHolds.isNotEmpty)
                         CustomPaint(
-                          size: Size(constraints.maxWidth, constraints.maxHeight),
+                          size: Size(
+                              constraints.maxWidth, constraints.maxHeight),
                           painter: HoldMarkerPainter(
                             holds: _detectedHolds,
                             imageSize: _imageSize ?? Size.zero,
-                            canvasSize: Size(constraints.maxWidth, constraints.maxHeight),
+                            canvasSize: Size(
+                                constraints.maxWidth, constraints.maxHeight),
                             editingHold: _editingHold,
                             isEditingMode: _isEditingMode,
                             isAddingHold: _isAddingHold,
@@ -378,7 +430,6 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
                             transformationController: _transformationController,
                           ),
                         ),
-                      // Loading overlay
                       if (_isAnalyzing)
                         Container(
                           color: Colors.black54,
@@ -388,10 +439,9 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
                               children: [
                                 CircularProgressIndicator(color: Colors.white),
                                 SizedBox(height: 16),
-                                Text(
-                                  'Analyzing holds...',
-                                  style: TextStyle(color: Colors.white, fontSize: 18),
-                                ),
+                                Text('Analyzing holds...',
+                                    style: TextStyle(
+                                        color: Colors.white, fontSize: 18)),
                               ],
                             ),
                           ),
@@ -408,15 +458,15 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     );
   }
 
+  // ── Gesture handlers ───────────────────────────────────────────────────────
+
   void _handleTap(Offset tapPosition, BoxConstraints constraints) {
     if (_imageSize == null || _detectedHolds.isEmpty) return;
 
     final imageCoords = _screenToImageCoordinates(tapPosition, constraints);
     if (imageCoords == null) return;
 
-    // Find hold that contains this point (using bounding box)
     ClimbingHold? tappedHold;
-    
     for (final hold in _detectedHolds) {
       if (_isPointInHold(imageCoords, hold)) {
         tappedHold = hold;
@@ -427,12 +477,8 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     if (tappedHold != null) {
       setState(() {
         if (_isEditingMode) {
-          // In editing mode, select hold for editing
           _editingHold = tappedHold;
         } else {
-          // In selection mode: tap unselected hold → select it with current role
-          // tap selected hold with same role → deselect
-          // tap selected hold with different role → keep selected, update role
           if (!tappedHold!.isSelected) {
             tappedHold.isSelected = true;
             tappedHold.role = _currentSelectionMode;
@@ -446,60 +492,103 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     }
   }
 
+  // ── Pan handlers: exclusively for add-hold box drawing ──────────────────
+  // Safe to use onPan* here because the IV is disabled in add mode,
+  // so there is no gesture arena conflict.
+
   void _handlePanStart(Offset position, BoxConstraints constraints) {
     if (_imageSize == null) return;
-
     final imageCoords = _screenToImageCoordinates(position, constraints);
     if (imageCoords == null) return;
-
-    if (_isAddingHold) {
-      // Start drawing new hold
-      setState(() {
-        _newHoldStart = imageCoords;
-        _lastDragPosition = imageCoords;
-      });
-    } else if (_isEditingMode) {
-      // Existing edit logic
-      for (final hold in _detectedHolds) {
-        if (_isPointInHold(imageCoords, hold)) {
-          setState(() {
-            _editingHold = hold;
-            _lastDragPosition = imageCoords;
-            
-            // Check if near edge for resize or center for move
-            final distToLeft = (imageCoords.dx - (hold.position.dx - hold.width / 2)).abs();
-            final distToRight = (imageCoords.dx - (hold.position.dx + hold.width / 2)).abs();
-            final distToTop = (imageCoords.dy - (hold.position.dy - hold.height / 2)).abs();
-            final distToBottom = (imageCoords.dy - (hold.position.dy + hold.height / 2)).abs();
-            
-            final edgeThreshold = 20.0;
-            
-            if (distToLeft < edgeThreshold || distToRight < edgeThreshold || 
-                distToTop < edgeThreshold || distToBottom < edgeThreshold) {
-              _editingAction = 'resize';
-            } else {
-              _editingAction = 'move';
-            }
-          });
-          break;
-        }
-      }
-    }
+    setState(() {
+      _panIsEditGesture = true;
+      _newHoldStart = imageCoords;
+      _lastDragPosition = imageCoords;
+    });
   }
 
   void _handlePanUpdate(Offset position, BoxConstraints constraints) {
+    if (!_panIsEditGesture) return;
     final imageCoords = _screenToImageCoordinates(position, constraints);
+    if (imageCoords == null) return;
+    setState(() => _lastDragPosition = imageCoords);
+  }
+
+  // ── Scale handlers: for edit/select mode (hold move/resize + pinch-zoom) ──
+
+  void _handleScaleStart(
+      ScaleStartDetails details, BoxConstraints constraints) {
+    // Multi-finger (pinch) → always let the InteractiveViewer handle it.
+    if (details.pointerCount > 1) {
+      _panIsEditGesture = false;
+      return;
+    }
+
+    if (_imageSize == null) return;
+    final imageCoords =
+        _screenToImageCoordinates(details.focalPoint, constraints);
+    if (imageCoords == null) return;
+
+    // Add-hold mode: any single-finger drag draws a new box.
+    if (_isAddingHold) {
+      setState(() {
+        _panIsEditGesture = true;
+        _newHoldStart = imageCoords;
+        _lastDragPosition = imageCoords;
+      });
+      return;
+    }
+
+    // Edit mode: single-finger drag on a hold = move/resize.
+    if (_isEditingMode) {
+      for (final hold in _detectedHolds) {
+        if (_isPointInHold(imageCoords, hold)) {
+          final distToLeft =
+              (imageCoords.dx - (hold.position.dx - hold.width / 2)).abs();
+          final distToRight =
+              (imageCoords.dx - (hold.position.dx + hold.width / 2)).abs();
+          final distToTop =
+              (imageCoords.dy - (hold.position.dy - hold.height / 2)).abs();
+          final distToBottom =
+              (imageCoords.dy - (hold.position.dy + hold.height / 2)).abs();
+          const edgeThreshold = 20.0;
+
+          setState(() {
+            _panIsEditGesture = true;
+            _editingHold = hold;
+            _lastDragPosition = imageCoords;
+            _editingAction = (distToLeft < edgeThreshold ||
+                    distToRight < edgeThreshold ||
+                    distToTop < edgeThreshold ||
+                    distToBottom < edgeThreshold)
+                ? 'resize'
+                : 'move';
+          });
+          return;
+        }
+      }
+    }
+
+    // Single finger on empty space → IV pans, we do nothing.
+    _panIsEditGesture = false;
+  }
+
+  void _handleScaleUpdate(
+      ScaleUpdateDetails details, BoxConstraints constraints) {
+    // Multi-finger or non-edit → don't interfere; IV handles zoom/pan.
+    if (!_panIsEditGesture || details.pointerCount > 1) return;
+
+    final imageCoords =
+        _screenToImageCoordinates(details.focalPoint, constraints);
     if (imageCoords == null) return;
 
     if (_isAddingHold && _newHoldStart != null) {
-      // Update new hold preview
-      setState(() {
-        _lastDragPosition = imageCoords;
-      });
-    } else if (_isEditingMode && _editingHold != null && _lastDragPosition != null) {
-      // Existing edit logic
-      final delta = imageCoords - _lastDragPosition!;
+      setState(() => _lastDragPosition = imageCoords);
+      return;
+    }
 
+    if (_isEditingMode && _editingHold != null && _lastDragPosition != null) {
+      final delta = imageCoords - _lastDragPosition!;
       setState(() {
         if (_editingAction == 'move') {
           _editingHold!.position = Offset(
@@ -507,72 +596,67 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
             _editingHold!.position.dy + delta.dy,
           );
         } else if (_editingAction == 'resize') {
-          final newWidth = (_editingHold!.width + delta.dx * 2).clamp(20.0, 200.0);
-          final newHeight = (_editingHold!.height + delta.dy * 2).clamp(20.0, 200.0);
-          
-          _editingHold!.width = newWidth;
-          _editingHold!.height = newHeight;
+          _editingHold!.width =
+              (_editingHold!.width + delta.dx * 2).clamp(20.0, 200.0);
+          _editingHold!.height =
+              (_editingHold!.height + delta.dy * 2).clamp(20.0, 200.0);
         }
-        
         _lastDragPosition = imageCoords;
       });
     }
   }
 
-  void _handlePanEnd() {
+  void _handleScaleEnd() {
+    if (!_panIsEditGesture) {
+      _panIsEditGesture = false;
+      return;
+    }
+
     if (_isAddingHold && _newHoldStart != null && _lastDragPosition != null) {
-      // Create new hold
       final width = (_lastDragPosition!.dx - _newHoldStart!.dx).abs();
       final height = (_lastDragPosition!.dy - _newHoldStart!.dy).abs();
-      
+
       if (width > 10 && height > 10) {
-        final centerX = (_newHoldStart!.dx + _lastDragPosition!.dx) / 2;
-        final centerY = (_newHoldStart!.dy + _lastDragPosition!.dy) / 2;
-        
         final newHold = ClimbingHold(
           id: 'manual_${DateTime.now().millisecondsSinceEpoch}',
-          position: Offset(centerX, centerY),
-          confidence: 1.0, // Manually added holds have 100% confidence
+          position: Offset(
+            (_newHoldStart!.dx + _lastDragPosition!.dx) / 2,
+            (_newHoldStart!.dy + _lastDragPosition!.dy) / 2,
+          ),
+          confidence: 1.0,
           width: width,
           height: height,
-          isSelected: true, // Auto-select
-          role: _currentSelectionMode, // Use current role
+          isSelected: true,
+          role: _currentSelectionMode,
         );
-        
-        setState(() {
-          _detectedHolds.add(newHold);
-        });
+        setState(() => _detectedHolds.add(newHold));
       }
-      
       setState(() {
         _newHoldStart = null;
         _lastDragPosition = null;
+        _panIsEditGesture = false;
       });
     } else {
       setState(() {
         _lastDragPosition = null;
         _editingAction = null;
+        _panIsEditGesture = false;
       });
     }
   }
 
-  Offset? _screenToImageCoordinates(Offset viewportPosition, BoxConstraints constraints) {
+  // ── Coordinate math ────────────────────────────────────────────────────────
+
+  Offset? _screenToImageCoordinates(
+      Offset viewportPosition, BoxConstraints constraints) {
     if (_imageSize == null) return null;
 
-    // The GestureDetector is now OUTSIDE the InteractiveViewer, so
-    // viewportPosition is in raw viewport (unzoomed) pixel space.
-    //
-    // Pipeline:
-    //   viewport px  →  [inverse IV transform]  →  content px  →  [un-letterbox + un-scale]  →  image px
+    final inverseMatrix =
+        Matrix4.inverted(_transformationController.value);
+    final contentPos =
+        MatrixUtils.transformPoint(inverseMatrix, viewportPosition);
 
-    // ── Step 1: Undo the InteractiveViewer zoom/pan ──────────────────────
-    // The IV transform maps content-space → viewport-space, so we invert it.
-    final matrix        = _transformationController.value;
-    final inverseMatrix = Matrix4.inverted(matrix);
-    final contentPos    = MatrixUtils.transformPoint(inverseMatrix, viewportPosition);
-
-    // ── Step 2: Compute letterbox layout (same as HoldMarkerPainter) ─────
-    final imageAspect     = _imageSize!.width / _imageSize!.height;
+    final imageAspect = _imageSize!.width / _imageSize!.height;
     final containerAspect = constraints.maxWidth / constraints.maxHeight;
 
     double displayScale;
@@ -580,67 +664,81 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
     double imageOffsetY = 0;
 
     if (imageAspect > containerAspect) {
-      // Wider than container → letterbox top/bottom
       displayScale = constraints.maxWidth / _imageSize!.width;
-      final displayHeight = _imageSize!.height * displayScale;
-      imageOffsetY = (constraints.maxHeight - displayHeight) / 2;
+      imageOffsetY =
+          (constraints.maxHeight - _imageSize!.height * displayScale) / 2;
     } else {
-      // Taller than container → letterbox left/right
       displayScale = constraints.maxHeight / _imageSize!.height;
-      final displayWidth = _imageSize!.width * displayScale;
-      imageOffsetX = (constraints.maxWidth - displayWidth) / 2;
+      imageOffsetX =
+          (constraints.maxWidth - _imageSize!.width * displayScale) / 2;
     }
 
-    // ── Step 3: Remove letterbox offset → image-display-space ────────────
-    final dispX = contentPos.dx - imageOffsetX;
-    final dispY = contentPos.dy - imageOffsetY;
-
-    // ── Step 4: Scale from display pixels → original image pixels ────────
-    final imageX = dispX / displayScale;
-    final imageY = dispY / displayScale;
-
-    // ── Step 5: Clamp to image bounds ────────────────────────────────────
     return Offset(
-      imageX.clamp(0.0, _imageSize!.width),
-      imageY.clamp(0.0, _imageSize!.height),
+      ((contentPos.dx - imageOffsetX) / displayScale)
+          .clamp(0.0, _imageSize!.width),
+      ((contentPos.dy - imageOffsetY) / displayScale)
+          .clamp(0.0, _imageSize!.height),
     );
   }
 
   bool _isPointInHold(Offset point, ClimbingHold hold) {
-    final left = hold.position.dx - hold.width / 2;
-    final right = hold.position.dx + hold.width / 2;
-    final top = hold.position.dy - hold.height / 2;
-    final bottom = hold.position.dy + hold.height / 2;
-    
-    return point.dx >= left && point.dx <= right && 
-           point.dy >= top && point.dy <= bottom;
+    return point.dx >= hold.position.dx - hold.width / 2 &&
+        point.dx <= hold.position.dx + hold.width / 2 &&
+        point.dy >= hold.position.dy - hold.height / 2 &&
+        point.dy <= hold.position.dy + hold.height / 2;
   }
 
-  /// Builds a role selector button. Tapping sets [_currentSelectionMode] so
-  /// that the NEXT hold the user taps on the image will be assigned this role.
-  /// The button appears highlighted when it is the active mode.
-  /// [icon] is ignored for HoldRole.foot — assets/foot.png is used instead.
-  Widget _buildRoleButtonColumn(String label, HoldRole role, IconData icon, Color color) {
+  // ── UI ─────────────────────────────────────────────────────────────────────
+
+  /// Generic circle-avatar + label button used for Edit, Add, and zoom controls.
+  /// Matches the visual style of [_buildRoleButtonColumn] so all toolbar
+  /// buttons look consistent and never overflow their label.
+  Widget _buildToolButton({
+    required String label,
+    required IconData icon,
+    required Color color,
+    required bool isActive,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircleAvatar(
+            backgroundColor: isActive ? color : Colors.grey[300],
+            radius: 18,
+            child: Icon(icon, color: isActive ? Colors.white : color, size: 20),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
+              color: isActive ? color : Colors.black87,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRoleButtonColumn(
+      String label, HoldRole role, IconData icon, Color color) {
     final isActiveMode = _currentSelectionMode == role;
 
     Widget iconWidget;
     if (role == HoldRole.foot) {
-      iconWidget = Image.asset(
-        'assets/foot.png',
-        width: 20,
-        height: 20,
-        color: isActiveMode ? Colors.white : color,
-      );
+      iconWidget = Image.asset('assets/icon/foot.png',
+          width: 20, height: 20, color: isActiveMode ? Colors.white : color);
     } else {
-      iconWidget = Icon(icon, color: isActiveMode ? Colors.white : color, size: 20);
+      iconWidget =
+          Icon(icon, color: isActiveMode ? Colors.white : color, size: 20);
     }
 
     return GestureDetector(
-      onTap: () {
-        setState(() {
-          _currentSelectionMode = role;
-        });
-      },
+      onTap: () => setState(() => _currentSelectionMode = role),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -650,23 +748,27 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
             child: iconWidget,
           ),
           const SizedBox(height: 4),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: isActiveMode ? FontWeight.bold : FontWeight.normal,
-              color: isActiveMode ? color : Colors.black87,
-            ),
-          ),
+          Text(label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight:
+                    isActiveMode ? FontWeight.bold : FontWeight.normal,
+                color: isActiveMode ? color : Colors.black87,
+              )),
         ],
       ),
     );
   }
 
   Widget _buildBottomPanel() {
-    final selectedCount = _detectedHolds.where((hold) => hold.isSelected).length;
-    final startCount = _detectedHolds.where((h) => h.isSelected && h.role == HoldRole.start).length;
-    final finishCount = _detectedHolds.where((h) => h.isSelected && h.role == HoldRole.finish).length;
+    final selectedCount =
+        _detectedHolds.where((h) => h.isSelected).length;
+    final startCount = _detectedHolds
+        .where((h) => h.isSelected && h.role == HoldRole.start)
+        .length;
+    final finishCount = _detectedHolds
+        .where((h) => h.isSelected && h.role == HoldRole.finish)
+        .length;
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -683,120 +785,80 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Mode toggle and zoom controls
-          Row(
+          // ── Toolbar: Edit / Add / Zoom — same circle+label style as role buttons
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.center,
             children: [
-              // Edit mode toggle
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _isEditingMode = !_isEditingMode;
-                      _isAddingHold = false;
-                      _editingHold = null;
-                      _newHoldStart = null;
-                    });
-                  },
-                  icon: Icon(
-                    _isEditingMode ? Icons.check : Icons.edit,
-                    size: 18,
-                  ),
-                  label: Text(
-                    _isEditingMode ? 'Done' : 'Edit',
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                  style: OutlinedButton.styleFrom(
-                    backgroundColor: _isEditingMode ? Colors.orange[100] : Colors.white,
-                    side: BorderSide(
-                      color: _isEditingMode ? Colors.orange : Colors.grey,
-                      width: 2,
-                    ),
-                  ),
-                ),
+              // Edit / Done toggle
+              _buildToolButton(
+                label: _isEditingMode ? 'Done' : 'Edit',
+                icon: _isEditingMode ? Icons.check : Icons.edit,
+                color: Colors.orange,
+                isActive: _isEditingMode,
+                onTap: () => setState(() {
+                  _isEditingMode = !_isEditingMode;
+                  _isAddingHold = false;
+                  _editingHold = null;
+                  _newHoldStart = null;
+                  _panIsEditGesture = false;
+                }),
               ),
-              const SizedBox(width: 8),
-              // Add hold button
+              // Add hold — only visible in edit mode
               if (_isEditingMode)
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () {
-                      setState(() {
-                        _isAddingHold = !_isAddingHold;
-                        _editingHold = null;
-                        _newHoldStart = null;
-                      });
-                    },
-                    icon: Icon(
-                      _isAddingHold ? Icons.close : Icons.add_box,
-                      size: 18,
-                    ),
-                    label: Text(
-                      _isAddingHold ? 'Cancel' : 'Add',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      backgroundColor: _isAddingHold ? Colors.blue[100] : Colors.white,
-                      side: BorderSide(
-                        color: _isAddingHold ? Colors.blue : Colors.grey,
-                        width: 2,
-                      ),
-                    ),
-                  ),
+                _buildToolButton(
+                  label: _isAddingHold ? 'Cancel' : 'Add',
+                  icon: _isAddingHold ? Icons.close : Icons.add_box,
+                  color: Colors.blue,
+                  isActive: _isAddingHold,
+                  onTap: () => setState(() {
+                    _isAddingHold = !_isAddingHold;
+                    _editingHold = null;
+                    _newHoldStart = null;
+                    _panIsEditGesture = false;
+                  }),
                 ),
-              if (_isEditingMode) const SizedBox(width: 8),
-              // Zoom controls
-              IconButton(
-                onPressed: () {
-                  setState(() {
-                    final currentScale = _transformationController.value.getMaxScaleOnAxis();
-                    final newScale = (currentScale * 1.3).clamp(0.5, 5.0);
-                    final focalPoint = Offset(
-                      _transformationController.value.getTranslation().x,
-                      _transformationController.value.getTranslation().y,
-                    );
-                    _transformationController.value = Matrix4.identity()
-                      ..translate(focalPoint.dx, focalPoint.dy)
-                      ..scale(newScale);
-                  });
-                },
-                icon: const Icon(Icons.zoom_in, size: 20),
-                tooltip: 'Zoom In',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
+              // Zoom in
+              _buildToolButton(
+                label: 'In',
+                icon: Icons.zoom_in,
+                color: Colors.grey[700]!,
+                isActive: false,
+                onTap: () => setState(() {
+                  final s = _transformationController.value.getMaxScaleOnAxis();
+                  final t = _transformationController.value.getTranslation();
+                  _transformationController.value = Matrix4.identity()
+                    ..translate(t.x, t.y)
+                    ..scale((s * 1.3).clamp(0.5, 5.0));
+                }),
               ),
-              IconButton(
-                onPressed: () {
-                  setState(() {
-                    final currentScale = _transformationController.value.getMaxScaleOnAxis();
-                    final newScale = (currentScale / 1.3).clamp(0.5, 5.0);
-                    final focalPoint = Offset(
-                      _transformationController.value.getTranslation().x,
-                      _transformationController.value.getTranslation().y,
-                    );
-                    _transformationController.value = Matrix4.identity()
-                      ..translate(focalPoint.dx, focalPoint.dy)
-                      ..scale(newScale);
-                  });
-                },
-                icon: const Icon(Icons.zoom_out, size: 20),
-                tooltip: 'Zoom Out',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
+              // Zoom out
+              _buildToolButton(
+                label: 'Out',
+                icon: Icons.zoom_out,
+                color: Colors.grey[700]!,
+                isActive: false,
+                onTap: () => setState(() {
+                  final s = _transformationController.value.getMaxScaleOnAxis();
+                  final t = _transformationController.value.getTranslation();
+                  _transformationController.value = Matrix4.identity()
+                    ..translate(t.x, t.y)
+                    ..scale((s / 1.3).clamp(0.5, 5.0));
+                }),
               ),
-              IconButton(
-                onPressed: () {
-                  setState(() {
-                    _transformationController.value = Matrix4.identity();
-                  });
-                },
-                icon: const Icon(Icons.crop_free, size: 20),
-                tooltip: 'Reset',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
+              // Reset zoom
+              _buildToolButton(
+                label: 'Reset',
+                icon: Icons.crop_free,
+                color: Colors.grey[700]!,
+                isActive: false,
+                onTap: () => setState(
+                    () => _transformationController.value = Matrix4.identity()),
               ),
             ],
           ),
-          
+
           if (_isAddingHold) ...[
             const SizedBox(height: 12),
             Container(
@@ -813,24 +875,28 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               ),
             ),
           ],
-          
+
           if (!_isEditingMode) ...[
             const SizedBox(height: 12),
-            // Role selector buttons — sets the mode for the next hold tapped
             Wrap(
               spacing: 8,
               runSpacing: 8,
               alignment: WrapAlignment.center,
               children: [
-                _buildRoleButtonColumn('Start', HoldRole.start, Icons.play_circle_filled, Colors.green),
-                _buildRoleButtonColumn('Hand/Foot', HoldRole.middle, Icons.circle, Colors.blue),
-                _buildRoleButtonColumn('Hand Only', HoldRole.hand, Icons.back_hand, Colors.indigo),
-                _buildRoleButtonColumn('Foot Only', HoldRole.foot, Icons.directions_walk, Colors.purple),
-                _buildRoleButtonColumn('Finish', HoldRole.finish, Icons.flag, Colors.red),
+                _buildRoleButtonColumn('Start', HoldRole.start,
+                    Icons.play_circle_filled, Colors.green),
+                _buildRoleButtonColumn(
+                    'Hand/Foot', HoldRole.middle, Icons.circle, Colors.blue),
+                _buildRoleButtonColumn('Hand Only', HoldRole.hand,
+                    Icons.back_hand, Colors.indigo),
+                _buildRoleButtonColumn('Foot Only', HoldRole.foot,
+                    Icons.directions_walk, Colors.purple),
+                _buildRoleButtonColumn(
+                    'Finish', HoldRole.finish, Icons.flag, Colors.red),
               ],
             ),
           ],
-          
+
           if (_isEditingMode && _editingHold != null && !_isAddingHold) ...[
             const SizedBox(height: 12),
             Container(
@@ -842,38 +908,34 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               ),
               child: Column(
                 children: [
-                  const Text(
-                    'Editing Hold',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-                  ),
+                  const Text('Editing Hold',
+                      style: TextStyle(
+                          fontWeight: FontWeight.bold, fontSize: 12)),
                   const SizedBox(height: 4),
-                  const Text(
-                    'Drag center to move • Drag edges to resize',
-                    style: TextStyle(fontSize: 11, color: Colors.black87),
-                  ),
+                  const Text('Drag center to move • Drag edges to resize',
+                      style:
+                          TextStyle(fontSize: 11, color: Colors.black87)),
                   const SizedBox(height: 4),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
                       TextButton.icon(
-                        onPressed: () {
-                          setState(() {
-                            _detectedHolds.remove(_editingHold);
-                            _editingHold = null;
-                          });
-                        },
+                        onPressed: () => setState(() {
+                          _detectedHolds.remove(_editingHold);
+                          _editingHold = null;
+                        }),
                         icon: const Icon(Icons.delete, size: 16),
-                        label: const Text('Delete', style: TextStyle(fontSize: 11)),
-                        style: TextButton.styleFrom(foregroundColor: Colors.red),
+                        label: const Text('Delete',
+                            style: TextStyle(fontSize: 11)),
+                        style: TextButton.styleFrom(
+                            foregroundColor: Colors.red),
                       ),
                       TextButton.icon(
-                        onPressed: () {
-                          setState(() {
-                            _editingHold = null;
-                          });
-                        },
+                        onPressed: () =>
+                            setState(() => _editingHold = null),
                         icon: const Icon(Icons.close, size: 16),
-                        label: const Text('Deselect', style: TextStyle(fontSize: 11)),
+                        label: const Text('Deselect',
+                            style: TextStyle(fontSize: 11)),
                       ),
                     ],
                   ),
@@ -881,24 +943,22 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               ),
             ),
           ],
-          
+
           const SizedBox(height: 12),
-          // Stats
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'Total: ${_detectedHolds.length}',
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
-              ),
+              Text('Total: ${_detectedHolds.length}',
+                  style:
+                      const TextStyle(fontSize: 12, color: Colors.grey)),
               Text(
                 'Start: $startCount | Middle: ${selectedCount - startCount - finishCount} | Finish: $finishCount',
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.bold),
               ),
             ],
           ),
           const SizedBox(height: 12),
-          // Action buttons
           Row(
             children: [
               Expanded(
@@ -910,8 +970,11 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               const SizedBox(width: 16),
               Expanded(
                 child: FilledButton(
-                  onPressed: selectedCount > 0 && startCount > 0 && finishCount > 0 && !_isAnalyzing 
-                      ? _createRoute 
+                  onPressed: selectedCount > 0 &&
+                          startCount > 0 &&
+                          finishCount > 0 &&
+                          !_isAnalyzing
+                      ? _createRoute
                       : null,
                   child: const Text('Create Route'),
                 ),
@@ -924,46 +987,18 @@ class _CreateRouteScreenState extends State<CreateRouteScreen> {
               child: Text(
                 'Select at least one start and one finish hold',
                 style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.orange[700],
-                  fontWeight: FontWeight.w500,
-                ),
+                    fontSize: 12,
+                    color: Colors.orange[700],
+                    fontWeight: FontWeight.w500),
               ),
             ),
         ],
       ),
     );
   }
-
-  Widget _buildRoleButton(String label, HoldRole role, IconData icon, Color color) {
-    final isSelected = _currentSelectionMode == role;
-    
-    return OutlinedButton.icon(
-      onPressed: () {
-        setState(() {
-          _currentSelectionMode = role;
-        });
-      },
-      icon: Icon(
-        icon,
-        size: 18,
-        color: isSelected ? Colors.white : color,
-      ),
-      label: Text(
-        label,
-        style: TextStyle(
-          fontSize: 12,
-          color: isSelected ? Colors.white : color,
-        ),
-      ),
-      style: OutlinedButton.styleFrom(
-        backgroundColor: isSelected ? color : Colors.white,
-        side: BorderSide(color: color, width: 2),
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
-      ),
-    );
-  }
 }
+
+// ── Painter ────────────────────────────────────────────────────────────────────
 
 class HoldMarkerPainter extends CustomPainter {
   final List<ClimbingHold> holds;
@@ -992,41 +1027,34 @@ class HoldMarkerPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (imageSize.width == 0 || imageSize.height == 0) return;
 
-    // Calculate scale to fit image in canvas
     final imageAspect = imageSize.width / imageSize.height;
     final canvasAspect = canvasSize.width / canvasSize.height;
-    
+
     double scale;
     double offsetX = 0;
     double offsetY = 0;
-    
+
     if (imageAspect > canvasAspect) {
       scale = canvasSize.width / imageSize.width;
-      final scaledHeight = imageSize.height * scale;
-      offsetY = (canvasSize.height - scaledHeight) / 2;
+      offsetY = (canvasSize.height - imageSize.height * scale) / 2;
     } else {
       scale = canvasSize.height / imageSize.height;
-      final scaledWidth = imageSize.width * scale;
-      offsetX = (canvasSize.width - scaledWidth) / 2;
+      offsetX = (canvasSize.width - imageSize.width * scale) / 2;
     }
 
-    // Draw existing holds
     for (final hold in holds) {
       final centerX = hold.position.dx * scale + offsetX;
       final centerY = hold.position.dy * scale + offsetY;
-      
       final boxWidth = hold.width * scale;
       final boxHeight = hold.height * scale;
-      
       final left = centerX - boxWidth / 2;
       final top = centerY - boxHeight / 2;
       final rect = Rect.fromLTWH(left, top, boxWidth, boxHeight);
-
       final isBeingEdited = editingHold == hold;
 
       Color fillColor;
       Color borderColor;
-      
+
       if (hold.isSelected) {
         switch (hold.role) {
           case HoldRole.start:
@@ -1042,11 +1070,13 @@ class HoldMarkerPainter extends CustomPainter {
             borderColor = Colors.blue;
             break;
           case HoldRole.hand:
-            fillColor = const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
+            fillColor =
+                const Color.fromARGB(255, 33, 68, 243).withOpacity(0.3);
             borderColor = Colors.indigo;
             break;
           case HoldRole.foot:
-            fillColor = const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
+            fillColor =
+                const Color.fromARGB(255, 159, 33, 243).withOpacity(0.3);
             borderColor = Colors.purple;
             break;
         }
@@ -1060,139 +1090,124 @@ class HoldMarkerPainter extends CustomPainter {
         borderColor = Colors.orange;
       }
 
-      final fillPaint = Paint()
-        ..color = fillColor
-        ..style = PaintingStyle.fill;
-      canvas.drawRect(rect, fillPaint);
+      canvas.drawRect(
+          rect, Paint()..color = fillColor..style = PaintingStyle.fill);
+      canvas.drawRect(
+          rect,
+          Paint()
+            ..color = borderColor
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = isBeingEdited ? 4 : (hold.isSelected ? 3 : 2));
 
-      final borderPaint = Paint()
-        ..color = borderColor
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = isBeingEdited ? 4 : (hold.isSelected ? 3 : 2);
-      canvas.drawRect(rect, borderPaint);
-
-      // Draw resize handles if being edited
       if (isBeingEdited && isEditingMode && !isAddingHold) {
-        final handleSize = 12.0;
-        final handlePaint = Paint()
-          ..color = Colors.orange
-          ..style = PaintingStyle.fill;
-        
-        canvas.drawCircle(Offset(left, top), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(left + boxWidth, top), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(left, top + boxHeight), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(left + boxWidth, top + boxHeight), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(centerX, top), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(centerX, top + boxHeight), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(left, centerY), handleSize / 2, handlePaint);
-        canvas.drawCircle(Offset(left + boxWidth, centerY), handleSize / 2, handlePaint);
+        const hs = 12.0;
+        final hp =
+            Paint()..color = Colors.orange..style = PaintingStyle.fill;
+        for (final pt in [
+          Offset(left, top),
+          Offset(left + boxWidth, top),
+          Offset(left, top + boxHeight),
+          Offset(left + boxWidth, top + boxHeight),
+          Offset(centerX, top),
+          Offset(centerX, top + boxHeight),
+          Offset(left, centerY),
+          Offset(left + boxWidth, centerY),
+        ]) {
+          canvas.drawCircle(pt, hs / 2, hp);
+        }
       }
 
       if (hold.isSelected && !isBeingEdited) {
-        final iconSize = 20.0;
+        const iconSize = 20.0;
         final iconX = centerX - iconSize / 2;
         final iconY = top - iconSize - 5;
-        
         final iconPaint = Paint()
           ..color = borderColor
           ..style = PaintingStyle.fill;
-        
+
         switch (hold.role) {
           case HoldRole.start:
-            final path = Path()
-              ..moveTo(iconX, iconY)
-              ..lineTo(iconX, iconY + iconSize)
-              ..lineTo(iconX + iconSize, iconY + iconSize / 2)
-              ..close();
-            canvas.drawPath(path, iconPaint);
+            canvas.drawPath(
+                Path()
+                  ..moveTo(iconX, iconY)
+                  ..lineTo(iconX, iconY + iconSize)
+                  ..lineTo(iconX + iconSize, iconY + iconSize / 2)
+                  ..close(),
+                iconPaint);
             break;
           case HoldRole.finish:
-            final path = Path()
-              ..moveTo(iconX, iconY + iconSize)
-              ..lineTo(iconX, iconY)
-              ..lineTo(iconX + iconSize * 0.7, iconY + iconSize * 0.3)
-              ..lineTo(iconX, iconY + iconSize * 0.6);
-            canvas.drawPath(path, iconPaint);
+            canvas.drawPath(
+                Path()
+                  ..moveTo(iconX, iconY + iconSize)
+                  ..lineTo(iconX, iconY)
+                  ..lineTo(iconX + iconSize * 0.7, iconY + iconSize * 0.3)
+                  ..lineTo(iconX, iconY + iconSize * 0.6),
+                iconPaint);
             break;
           case HoldRole.middle:
           case HoldRole.hand:
           case HoldRole.foot:
             canvas.drawCircle(
-              Offset(iconX + iconSize / 2, iconY + iconSize / 2),
-              iconSize / 3,
-              iconPaint,
-            );
+                Offset(iconX + iconSize / 2, iconY + iconSize / 2),
+                iconSize / 3,
+                iconPaint);
             break;
         }
       }
 
-      final confidenceText = '${(hold.confidence * 100).toInt()}%';
       final textPainter = TextPainter(
         text: TextSpan(
-          text: confidenceText,
+          text: '${(hold.confidence * 100).toInt()}%',
           style: TextStyle(
             color: hold.isSelected ? borderColor : Colors.grey[600],
             fontSize: 10,
             fontWeight: FontWeight.bold,
-            shadows: const [
-              Shadow(
-                color: Colors.white,
-                blurRadius: 3,
-              ),
-            ],
+            shadows: const [Shadow(color: Colors.white, blurRadius: 3)],
           ),
         ),
         textDirection: TextDirection.ltr,
-      );
-      textPainter.layout();
-      textPainter.paint(
-        canvas,
-        Offset(centerX - textPainter.width / 2, top + boxHeight + 5),
-      );
+      )..layout();
+      textPainter.paint(canvas,
+          Offset(centerX - textPainter.width / 2, top + boxHeight + 5));
     }
 
-    // Draw new hold preview
     if (isAddingHold && newHoldStart != null && newHoldEnd != null) {
       final startX = newHoldStart!.dx * scale + offsetX;
       final startY = newHoldStart!.dy * scale + offsetY;
       final endX = newHoldEnd!.dx * scale + offsetX;
       final endY = newHoldEnd!.dy * scale + offsetY;
-      
-      final left = startX < endX ? startX : endX;
-      final top = startY < endY ? startY : endY;
-      final width = (startX - endX).abs();
-      final height = (startY - endY).abs();
-      
-      final previewRect = Rect.fromLTWH(left, top, width, height);
-      
-      final previewFillPaint = Paint()
-        ..color = Colors.blue.withOpacity(0.3)
-        ..style = PaintingStyle.fill;
-      canvas.drawRect(previewRect, previewFillPaint);
-      
-      final previewBorderPaint = Paint()
-        ..color = Colors.blue
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 3;
-      canvas.drawRect(previewRect, previewBorderPaint);
+
+      final previewRect = Rect.fromLTRB(
+        startX < endX ? startX : endX,
+        startY < endY ? startY : endY,
+        startX < endX ? endX : startX,
+        startY < endY ? endY : startY,
+      );
+
+      canvas.drawRect(
+          previewRect,
+          Paint()
+            ..color = Colors.blue.withOpacity(0.3)
+            ..style = PaintingStyle.fill);
+      canvas.drawRect(
+          previewRect,
+          Paint()
+            ..color = Colors.blue
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 3);
     }
   }
 
   @override
-  bool shouldRepaint(covariant HoldMarkerPainter oldDelegate) {
-    return oldDelegate.holds != holds || 
-           oldDelegate.editingHold != editingHold ||
-           oldDelegate.isEditingMode != isEditingMode ||
-           oldDelegate.isAddingHold != isAddingHold ||
-           oldDelegate.newHoldStart != newHoldStart ||
-           oldDelegate.newHoldEnd != newHoldEnd;
-  }
+  bool shouldRepaint(covariant HoldMarkerPainter oldDelegate) =>
+      oldDelegate.holds != holds ||
+      oldDelegate.editingHold != editingHold ||
+      oldDelegate.isEditingMode != isEditingMode ||
+      oldDelegate.isAddingHold != isAddingHold ||
+      oldDelegate.newHoldStart != newHoldStart ||
+      oldDelegate.newHoldEnd != newHoldEnd;
 }
 
-// Extension to draw dashed lines
 extension DashedPath on Paint {
-  set strokeDashArray(List<double> dashArray) {
-    // Note: Flutter doesn't natively support dashed lines in Paint
-    // This is a placeholder - the actual implementation would need PathMetrics
-  }
+  set strokeDashArray(List<double> _) {}
 }

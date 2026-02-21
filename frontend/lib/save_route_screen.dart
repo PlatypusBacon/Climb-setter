@@ -4,6 +4,9 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'climbing_models.dart';
 import 'annotation_painter.dart';
+import 'route_model.dart';
+import 'route_database.dart';
+import 'storage_service.dart';
 
 class SaveRouteScreen extends StatefulWidget {
   final String? imagePath;
@@ -28,14 +31,15 @@ class SaveRouteScreen extends StatefulWidget {
 class _SaveRouteScreenState extends State<SaveRouteScreen> {
   final _nameController = TextEditingController();
   String _selectedDifficulty = 'V0';
-  bool _isSequenceClimb = false; // new field
+  bool _isSequenceClimb = false;
+  bool _isSaving = false;
 
   final List<String> _difficulties = [
     'V0', 'V1', 'V2', 'V3', 'V4', 'V5',
     'V6', 'V7', 'V8', 'V9', 'V10+'
   ];
 
-  void _saveRoute() {
+  Future<void> _saveRoute() async {
     if (_nameController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please enter a route name')),
@@ -43,26 +47,70 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
       return;
     }
 
-    final route = ClimbingRoute(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      name: _nameController.text,
-      imagePath: widget.imagePath ??
-          'web_${DateTime.now().millisecondsSinceEpoch}',
-      imageBytes: widget.imageBytes,
-      imageSize: widget.imageSize, // pass through so detail screen can scale
-      holds: widget.selectedHolds,
-      createdAt: DateTime.now(),
-      difficulty: _selectedDifficulty,
-      isSequenceClimb: _isSequenceClimb,
-    );
+    setState(() => _isSaving = true);
 
-    widget.onSave(route);
+    try {
+      final id = DateTime.now().millisecondsSinceEpoch.toString();
+      final storageService = RouteStorageService();
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Route saved successfully!')),
-    );
+      // 1. Save wall image to disk
+      String imagePath = widget.imagePath ?? '';
+      if (widget.imageBytes != null) {
+        imagePath = await storageService.saveWallImage(widget.imageBytes!, id);
+      }
 
-    Navigator.popUntil(context, (route) => route.isFirst);
+      // 2. Generate annotated export
+      String? annotatedPath;
+      if (widget.imageBytes != null && widget.imageSize != null) {
+        annotatedPath = await storageService.exportAnnotatedImage(
+          routeId: id,
+          imageBytes: widget.imageBytes!,
+          holds: widget.selectedHolds,
+          imageSize: widget.imageSize!,
+        );
+      }
+
+      // 3. Persist to SQLite
+      final savedRoute = SavedRoute(
+        id: id,
+        name: _nameController.text,
+        difficulty: _selectedDifficulty,
+        holds: widget.selectedHolds,
+        imagePath: imagePath,
+        annotatedImagePath: annotatedPath,
+        createdAt: DateTime.now(),
+        imageSize: widget.imageSize ?? Size.zero,
+      );
+      await RouteDatabase.instance.insertRoute(savedRoute);
+
+      // 4. Update in-memory state so UI reflects change immediately
+      widget.onSave(ClimbingRoute(
+        id: id,
+        name: _nameController.text,
+        imagePath: imagePath,
+        imageBytes: widget.imageBytes,
+        imageSize: widget.imageSize,
+        holds: widget.selectedHolds,
+        createdAt: DateTime.now(),
+        difficulty: _selectedDifficulty,
+        isSequenceClimb: _isSequenceClimb,
+      ));
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Route saved successfully!')),
+        );
+        Navigator.popUntil(context, (route) => route.isFirst);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save route: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
   }
 
   @override
@@ -78,7 +126,6 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Preview
               Container(
                 width: double.infinity,
                 height: 200,
@@ -91,24 +138,11 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                   child: Stack(
                     children: [
                       if (widget.imageBytes != null)
-                        Image.memory(
-                          widget.imageBytes!,
-                          fit: BoxFit.cover,
-                          width: double.infinity,
-                        )
+                        Image.memory(widget.imageBytes!, fit: BoxFit.cover, width: double.infinity)
                       else if (widget.imagePath != null && !kIsWeb)
-                        Image.file(
-                          File(widget.imagePath!),
-                          fit: BoxFit.cover,
-                          width: double.infinity,
-                        )
+                        Image.file(File(widget.imagePath!), fit: BoxFit.cover, width: double.infinity)
                       else
-                        Container(
-                          color: Colors.grey[300],
-                          child: const Center(
-                            child: Icon(Icons.image, size: 50),
-                          ),
-                        ),
+                        Container(color: Colors.grey[300], child: const Center(child: Icon(Icons.image, size: 50))),
                       CustomPaint(
                         painter: RouteAnnotationPainter(
                           holds: widget.selectedHolds,
@@ -120,8 +154,6 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 ),
               ),
               const SizedBox(height: 24),
-
-              // Route name
               TextField(
                 controller: _nameController,
                 decoration: const InputDecoration(
@@ -133,10 +165,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 textCapitalization: TextCapitalization.words,
               ),
               const SizedBox(height: 24),
-
-              // Difficulty
-              Text('Difficulty',
-                  style: Theme.of(context).textTheme.titleMedium),
+              Text('Difficulty', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
               DropdownButtonFormField<String>(
                 value: _selectedDifficulty,
@@ -147,89 +176,60 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
                 items: _difficulties
                     .map((d) => DropdownMenuItem(value: d, child: Text(d)))
                     .toList(),
-                onChanged: (value) =>
-                    setState(() => _selectedDifficulty = value!),
+                onChanged: (value) => setState(() => _selectedDifficulty = value!),
               ),
               const SizedBox(height: 16),
-
-              // ── Sequence climb checkbox ─────────────────────────────────
               Card(
                 child: CheckboxListTile(
                   value: _isSequenceClimb,
-                  onChanged: (v) =>
-                      setState(() => _isSequenceClimb = v ?? false),
-                  title: const Text(
-                    'Sequence Climb',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  subtitle: const Text(
-                    'Show numbered hold order when viewing this route',
-                    style: TextStyle(fontSize: 12),
-                  ),
+                  onChanged: (v) => setState(() => _isSequenceClimb = v ?? false),
+                  title: const Text('Sequence Climb', style: TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: const Text('Show numbered hold order when viewing this route', style: TextStyle(fontSize: 12)),
                   secondary: const Icon(Icons.format_list_numbered),
                   controlAffinity: ListTileControlAffinity.leading,
                 ),
               ),
               const SizedBox(height: 16),
-
-              // Summary card
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Route Summary',
-                          style: Theme.of(context).textTheme.titleMedium),
+                      Text('Route Summary', style: Theme.of(context).textTheme.titleMedium),
                       const SizedBox(height: 12),
-                      _buildSummaryRow(
-                        Icons.play_circle_filled,
-                        'Start Holds',
-                        '${widget.selectedHolds.where((h) => h.role == HoldRole.start).length}',
-                      ),
+                      _buildSummaryRow(Icons.play_circle_filled, 'Start Holds',
+                          '${widget.selectedHolds.where((h) => h.role == HoldRole.start).length}'),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                        Icons.sports_handball,
-                        'Hand/Foot Holds',
-                        '${widget.selectedHolds.where((h) => h.role == HoldRole.middle).length}',
-                      ),
+                      _buildSummaryRow(Icons.sports_handball, 'Hand/Foot Holds',
+                          '${widget.selectedHolds.where((h) => h.role == HoldRole.middle).length}'),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                        Icons.back_hand,
-                        'Hand Only Holds',
-                        '${widget.selectedHolds.where((h) => h.role == HoldRole.hand).length}',
-                      ),
+                      _buildSummaryRow(Icons.back_hand, 'Hand Only Holds',
+                          '${widget.selectedHolds.where((h) => h.role == HoldRole.hand).length}'),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                        Icons.directions_walk,
-                        'Foot Only Holds',
-                        '${widget.selectedHolds.where((h) => h.role == HoldRole.foot).length}',
-                      ),
+                      _buildSummaryRow(Icons.directions_walk, 'Foot Only Holds',
+                          '${widget.selectedHolds.where((h) => h.role == HoldRole.foot).length}'),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                        Icons.flag,
-                        'Finish Holds',
-                        '${widget.selectedHolds.where((h) => h.role == HoldRole.finish).length}',
-                      ),
+                      _buildSummaryRow(Icons.flag, 'Finish Holds',
+                          '${widget.selectedHolds.where((h) => h.role == HoldRole.finish).length}'),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                          Icons.bar_chart, 'Difficulty', _selectedDifficulty),
+                      _buildSummaryRow(Icons.bar_chart, 'Difficulty', _selectedDifficulty),
                       const SizedBox(height: 8),
-                      _buildSummaryRow(
-                          Icons.percent, 'Avg Confidence', _getAverageConfidence()),
+                      _buildSummaryRow(Icons.percent, 'Avg Confidence', _getAverageConfidence()),
                     ],
                   ),
                 ),
               ),
               const SizedBox(height: 32),
-
               SizedBox(
                 width: double.infinity,
                 child: FilledButton(
-                  onPressed: _saveRoute,
-                  child: const Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Text('Save to Library'),
+                  onPressed: _isSaving ? null : _saveRoute,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: _isSaving
+                        ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Text('Save to Library'),
                   ),
                 ),
               ),
@@ -245,8 +245,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
       children: [
         Icon(icon, size: 20, color: Colors.grey[600]),
         const SizedBox(width: 8),
-        Text('$label: ',
-            style: const TextStyle(fontWeight: FontWeight.w500)),
+        Text('$label: ', style: const TextStyle(fontWeight: FontWeight.w500)),
         Text(value),
       ],
     );
@@ -254,9 +253,7 @@ class _SaveRouteScreenState extends State<SaveRouteScreen> {
 
   String _getAverageConfidence() {
     if (widget.selectedHolds.isEmpty) return '0%';
-    final avg = widget.selectedHolds
-            .map((h) => h.confidence)
-            .reduce((a, b) => a + b) /
+    final avg = widget.selectedHolds.map((h) => h.confidence).reduce((a, b) => a + b) /
         widget.selectedHolds.length;
     return '${(avg * 100).toInt()}%';
   }

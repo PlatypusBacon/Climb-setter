@@ -23,25 +23,25 @@ class ClimbingHold {
   });
 
   Map<String, dynamic> toMap() => {
-        'id': id,
-        'position_dx': position.dx,
-        'position_dy': position.dy,
-        'confidence': confidence,
-        'width': width,
-        'height': height,
-        'is_selected': isSelected ? 1 : 0,
-        'role': role.name,
-      };
+    'id': id,
+    'position_dx': position.dx,
+    'position_dy': position.dy,
+    'confidence': confidence,
+    'width': width,
+    'height': height,
+    'is_selected': isSelected ? 1 : 0,
+    'role': role.name,
+  };
 
   factory ClimbingHold.fromMap(Map<String, dynamic> map) => ClimbingHold(
-        id: map['id'],
-        position: Offset(map['position_dx'], map['position_dy']),
-        confidence: map['confidence'],
-        width: map['width'],
-        height: map['height'],
-        isSelected: map['is_selected'] == 1,
-        role: HoldRole.values.byName(map['role']),
-      );
+    id: map['id'],
+    position: Offset(map['position_dx'], map['position_dy']),
+    confidence: map['confidence'],
+    width: map['width'],
+    height: map['height'],
+    isSelected: map['is_selected'] == 1,
+    role: HoldRole.values.byName(map['role']),
+  );
 }
 
 class ClimbingRoute {
@@ -49,11 +49,11 @@ class ClimbingRoute {
   final String name;
   final String imagePath;
   final Uint8List? imageBytes;
-  final Size? imageSize; // original image dimensions — needed for overlay scaling
+  final Size? imageSize;  // fixed: belongs here, not super
   final List<ClimbingHold> holds;
   final DateTime createdAt;
   final String difficulty;
-  final bool isSequenceClimb; // whether to show numbered hold sequence
+  final bool isSequenceClimb;
 
   ClimbingRoute({
     required this.id,
